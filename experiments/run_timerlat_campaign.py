@@ -61,6 +61,16 @@ def _empty_trace(trace: str) -> bool:
     return bool(match and match.group(1) == "0" and match.group(2) == "0")
 
 
+def _normalized_event_filter(raw_filter: str | None) -> str | None:
+    """Return the active filter expression, excluding tracefs diagnostics."""
+    if raw_filter is None:
+        return None
+    first_line = raw_filter.splitlines()[0].strip() if raw_filter.splitlines() else ""
+    if first_line in ("", "none", "0"):
+        return "none"
+    return first_line
+
+
 def _option_enabled(options: str, option: str) -> bool:
     words = set(options.split())
     if f"NO_{option}" in words:
@@ -92,6 +102,7 @@ class TracefsTimerlat:
         options = _read(self.tracefs / "osnoise/options")
         idle_event = self.tracefs / "events/power/cpu_idle"
         trace_clock_path = self.tracefs / "trace_clock"
+        idle_filter_raw = _read(idle_event / "filter") if (idle_event / "filter").exists() else None
         return {
             "current_tracer": _read(self.tracefs / "current_tracer"),
             "tracing_on": _read(self.tracefs / "tracing_on"),
@@ -103,7 +114,8 @@ class TracefsTimerlat:
             "osnoise_options_raw": options,
             "enabled_events": _read(self.tracefs / "set_event"),
             "cpu_idle_event_enabled": _read(idle_event / "enable") if (idle_event / "enable").exists() else None,
-            "cpu_idle_event_filter": _read(idle_event / "filter") if (idle_event / "filter").exists() else None,
+            "cpu_idle_event_filter": _normalized_event_filter(idle_filter_raw),
+            "cpu_idle_event_filter_raw": idle_filter_raw,
             "trace_empty": _empty_trace((self.tracefs / "trace").read_text(errors="replace")),
         }
 
@@ -153,67 +165,74 @@ class TracefsTimerlat:
 
         trace = ""
         cpu_stats = ""
-        errors: list[Exception] = []
+        errors: list[str] = []
         try:
             _write(self.tracefs / "tracing_on", "0")
-            trace = (self.tracefs / "trace").read_text(errors="replace")
-            stats_path = self.tracefs / f"per_cpu/cpu{self.cpu}/stats"
-            if stats_path.exists():
-                cpu_stats = stats_path.read_text(errors="replace")
         except Exception as exc:  # restoration still takes priority over collection
-            errors.append(exc)
-        finally:
-            if self.cpu_idle_cpu is not None:
-                idle_event = self.tracefs / "events/power/cpu_idle"
-                saved_filter = self.before["cpu_idle_event_filter"]
-                filter_reset = "0" if saved_filter in (None, "none", "") else saved_filter
-                for path, value in (
-                    (idle_event / "enable", self.before["cpu_idle_event_enabled"] or "0"),
-                    (idle_event / "filter", filter_reset),
-                ):
-                    try:
-                        _write(path, value)
-                    except Exception as exc:
-                        errors.append(exc)
-            restore_actions = [
-                (self.tracefs / "current_tracer", "nop"),
-                (self.tracefs / "trace", ""),
-                (self.tracefs / "osnoise/timerlat_period_us", self.before["timerlat_period_us"]),
-                (self.tracefs / "osnoise/cpus", self.before["osnoise_cpus"]),
-                (self.tracefs / "buffer_size_kb", self.before["buffer_size_kb"]),
-            ]
-            for path, value in restore_actions:
-                try:
-                    _write(path, value)
-                except Exception as exc:
-                    errors.append(exc)
+            errors.append(f"write {self.tracefs / 'tracing_on'}: {type(exc).__name__}: {exc}")
+        try:
+            trace = (self.tracefs / "trace").read_text(errors="replace")
+        except Exception as exc:
+            errors.append(f"read {self.tracefs / 'trace'}: {type(exc).__name__}: {exc}")
+        stats_path = self.tracefs / f"per_cpu/cpu{self.cpu}/stats"
+        if stats_path.exists():
             try:
-                current_options = _read(self.tracefs / "osnoise/options")
-                current_enabled = _option_enabled(current_options, "OSNOISE_WORKLOAD")
-                if current_enabled != self.before["osnoise_workload_enabled"]:
-                    toggle = (
-                        "OSNOISE_WORKLOAD"
-                        if self.before["osnoise_workload_enabled"]
-                        else "NO_OSNOISE_WORKLOAD"
-                    )
-                    _write(self.tracefs / "osnoise/options", toggle)
+                cpu_stats = stats_path.read_text(errors="replace")
             except Exception as exc:
-                errors.append(exc)
+                errors.append(f"read {stats_path}: {type(exc).__name__}: {exc}")
+        if self.cpu_idle_cpu is not None:
+            idle_event = self.tracefs / "events/power/cpu_idle"
+            saved_filter = self.before["cpu_idle_event_filter"]
+            filter_reset = "0" if saved_filter in (None, "none", "") else saved_filter
             for path, value in (
-                (self.tracefs / "current_tracer", self.before["current_tracer"]),
-                (self.tracefs / "tracing_on", self.before["tracing_on"]),
+                (idle_event / "enable", self.before["cpu_idle_event_enabled"] or "0"),
+                (idle_event / "filter", filter_reset),
             ):
                 try:
                     _write(path, value)
                 except Exception as exc:
-                    errors.append(exc)
-            self.changed = False
+                    errors.append(f"write {path}: {type(exc).__name__}: {exc}")
+        restore_actions = [
+            (self.tracefs / "current_tracer", "nop"),
+            (self.tracefs / "trace", ""),
+            (self.tracefs / "osnoise/timerlat_period_us", self.before["timerlat_period_us"]),
+            (self.tracefs / "osnoise/cpus", self.before["osnoise_cpus"]),
+            (self.tracefs / "buffer_size_kb", self.before["buffer_size_kb"]),
+        ]
+        for path, value in restore_actions:
+            try:
+                _write(path, value)
+            except Exception as exc:
+                errors.append(f"write {path}: {type(exc).__name__}: {exc}")
+        try:
+            current_options = _read(self.tracefs / "osnoise/options")
+            current_enabled = _option_enabled(current_options, "OSNOISE_WORKLOAD")
+            if current_enabled != self.before["osnoise_workload_enabled"]:
+                toggle = (
+                    "OSNOISE_WORKLOAD"
+                    if self.before["osnoise_workload_enabled"]
+                    else "NO_OSNOISE_WORKLOAD"
+                )
+                _write(self.tracefs / "osnoise/options", toggle)
+        except Exception as exc:
+            errors.append(
+                f"read/write {self.tracefs / 'osnoise/options'}: {type(exc).__name__}: {exc}"
+            )
+        for path, value in (
+            (self.tracefs / "current_tracer", self.before["current_tracer"]),
+            (self.tracefs / "tracing_on", self.before["tracing_on"]),
+        ):
+            try:
+                _write(path, value)
+            except Exception as exc:
+                errors.append(f"write {path}: {type(exc).__name__}: {exc}")
+        self.changed = False
 
         after: dict[str, Any] = {}
         try:
             after = self._settings()
         except Exception as exc:
-            errors.append(exc)
+            errors.append(f"snapshot after restoration: {type(exc).__name__}: {exc}")
         restored = bool(after) and all(
             after.get(key) == self.before[key]
             for key in (
@@ -234,7 +253,7 @@ class TracefsTimerlat:
             "before": self.before,
             "after": after,
             "restored": restored,
-            "errors": [f"{type(error).__name__}: {error}" for error in errors],
+            "errors": errors,
             "cpu_buffer_stats": cpu_stats,
             "trace": trace,
         }

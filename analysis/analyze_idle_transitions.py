@@ -25,6 +25,7 @@ _TIMERLAT_IRQ_LINE = re.compile(
 )
 _IDLE_EXIT = 0xFFFFFFFF
 _NS_PER_SECOND = Decimal(1_000_000_000)
+_POST_EXIT_LOOKBACK_NS = 10_000
 
 
 def analyze_idle_transitions(
@@ -33,10 +34,13 @@ def analyze_idle_transitions(
     cpu: int,
     state_names: dict[int, str] | None = None,
 ) -> dict[str, Any]:
-    """Attribute each timerlat IRQ to an open cpu_idle state on the same CPU.
+    """Associate timerlat IRQs with the adjacent cpu_idle interval on the same CPU.
 
     Both event types are read from the same CPU-local ftrace stream. The trace
     clock is an observation domain, not an independent elapsed-time reference.
+    Linux may emit the cpu_idle exit event just before the timerlat IRQ event,
+    so an IRQ may be joined to the immediately preceding completed interval
+    when it follows the exit by no more than the bounded lookback window.
     """
     names = state_names or {}
     events: list[tuple[Decimal, int, str, dict[str, int]]] = []
@@ -86,10 +90,15 @@ def analyze_idle_transitions(
 
     current_state: int | None = None
     state_entry_timestamp: Decimal | None = None
+    last_completed_interval: tuple[int, Decimal, Decimal] | None = None
     entries_by_state: dict[int, list[int]] = defaultdict(list)
     intervals_by_state: dict[int, list[int]] = defaultdict(list)
     activations_by_state: dict[int, list[int]] = defaultdict(list)
     entry_to_irq_by_state: dict[int, list[int]] = defaultdict(list)
+    post_exit_to_irq_by_state: dict[int, list[int]] = defaultdict(list)
+    phase_counts_by_state: dict[int, dict[str, int]] = defaultdict(
+        lambda: {"while_idle_state_open": 0, "after_idle_exit": 0}
+    )
     unmatched_idle_exit_count = 0
     overlapping_idle_entry_count = 0
     incomplete_idle_interval_count = 0
@@ -107,6 +116,7 @@ def analyze_idle_transitions(
                     incomplete_idle_interval_count += 1
                 else:
                     intervals_by_state[current_state].append(duration_ns)
+                    last_completed_interval = (current_state, state_entry_timestamp, timestamp)
                 current_state = None
                 state_entry_timestamp = None
                 continue
@@ -114,19 +124,33 @@ def analyze_idle_transitions(
             if current_state is not None:
                 overlapping_idle_entry_count += 1
                 incomplete_idle_interval_count += 1
+            last_completed_interval = None
             current_state = state
             state_entry_timestamp = timestamp
             continue
 
-        if current_state is None or state_entry_timestamp is None:
-            unmatched_timerlat_irq_count += 1
-            continue
-        elapsed_ns = int((timestamp - state_entry_timestamp) * _NS_PER_SECOND)
-        if elapsed_ns < 0:
-            unmatched_timerlat_irq_count += 1
-            continue
-        entries_by_state[current_state].append(fields["latency_ns"])
-        entry_to_irq_by_state[current_state].append(elapsed_ns)
+        if current_state is not None and state_entry_timestamp is not None:
+            elapsed_ns = int((timestamp - state_entry_timestamp) * _NS_PER_SECOND)
+            if elapsed_ns >= 0:
+                entries_by_state[current_state].append(fields["latency_ns"])
+                entry_to_irq_by_state[current_state].append(elapsed_ns)
+                phase_counts_by_state[current_state]["while_idle_state_open"] += 1
+                continue
+
+        if last_completed_interval is not None:
+            completed_state, entry_timestamp, exit_timestamp = last_completed_interval
+            after_exit_ns = int((timestamp - exit_timestamp) * _NS_PER_SECOND)
+            if 0 <= after_exit_ns <= _POST_EXIT_LOOKBACK_NS:
+                entries_by_state[completed_state].append(fields["latency_ns"])
+                entry_to_irq_by_state[completed_state].append(
+                    int((timestamp - entry_timestamp) * _NS_PER_SECOND)
+                )
+                post_exit_to_irq_by_state[completed_state].append(after_exit_ns)
+                phase_counts_by_state[completed_state]["after_idle_exit"] += 1
+                last_completed_interval = None
+                continue
+
+        unmatched_timerlat_irq_count += 1
 
     open_idle_interval_at_trace_end = current_state is not None
     state_summaries = []
@@ -137,7 +161,9 @@ def analyze_idle_transitions(
                 "state_name": names.get(state, f"state{state}"),
                 "timerlat_irq_activations": len(entries_by_state[state]),
                 "timerlat_irq_latency_ns": _quantiles(entries_by_state[state]),
+                "timerlat_irq_phase_counts": phase_counts_by_state[state],
                 "trace_entry_to_irq_ns": _quantiles(entry_to_irq_by_state[state]),
+                "trace_exit_to_irq_ns": _quantiles(post_exit_to_irq_by_state[state]),
                 "completed_idle_intervals": len(intervals_by_state[state]),
                 "trace_entry_to_exit_ns": _quantiles(intervals_by_state[state]),
             }
@@ -150,8 +176,15 @@ def analyze_idle_transitions(
         "cpu": cpu,
         "clock_domain": "same-CPU ftrace timestamp stream; not an independent elapsed-time reference",
         "idle_exit_sentinel": _IDLE_EXIT,
+        "post_exit_match_lookback_ns": _POST_EXIT_LOOKBACK_NS,
         "timerlat_irq_events": irq_event_count,
         "matched_idle_state_activations": matched_activations,
+        "matched_while_idle_state_open": sum(
+            phases["while_idle_state_open"] for phases in phase_counts_by_state.values()
+        ),
+        "matched_after_idle_exit": sum(
+            phases["after_idle_exit"] for phases in phase_counts_by_state.values()
+        ),
         "unmatched_timerlat_irq_events": unmatched_timerlat_irq_count,
         "cpu_idle_events": idle_event_count,
         "completed_idle_intervals": completed_intervals,

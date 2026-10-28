@@ -14,6 +14,7 @@ from experiments.run_timerlat_campaign import (
     CpuDmaLatencyRequest,
     TracefsTimerlat,
     _empty_trace,
+    _normalized_event_filter,
     _option_enabled,
 )
 
@@ -136,6 +137,17 @@ class TestTimerlatCampaignAnalysis(unittest.TestCase):
 
 
 class TestTracefsHelpers(unittest.TestCase):
+    def test_normalizes_stale_tracefs_filter_diagnostics(self):
+        self.assertEqual(
+            _normalized_event_filter("none\n ^\nparse_error: Field not found: cpu_id\n"),
+            "none",
+        )
+        self.assertEqual(
+            _normalized_event_filter("cpu_id == 7\n ^\nparse_error: stale\n"),
+            "cpu_id == 7",
+        )
+        self.assertIsNone(_normalized_event_filter(None))
+
     def test_cpu_idle_tracepoint_filter_is_enabled_and_restored(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -193,6 +205,58 @@ class TestTracefsHelpers(unittest.TestCase):
             self.assertEqual((root / "events/power/cpu_idle/filter").read_text().strip(), "0")
             self.assertEqual((root / "current_tracer").read_text().strip(), "nop")
             self.assertEqual((root / "tracing_on").read_text().strip(), "1")
+
+    def test_restore_error_names_path_and_keeps_collected_trace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            files = {
+                "current_tracer": "nop\n",
+                "tracing_on": "1\n",
+                "buffer_size_kb": "7\n",
+                "trace_clock": "local global counter\n",
+                "available_tracers": "nop timerlat\n",
+                "set_event": "\n",
+                "trace": "# entries-in-buffer/entries-written: 0/0 #P:8\n",
+                "osnoise/options": "NO_OSNOISE_WORKLOAD\n",
+                "osnoise/cpus": "0-7\n",
+                "osnoise/timerlat_period_us": "1000\n",
+                "events/power/cpu_idle/enable": "0\n",
+                "events/power/cpu_idle/filter": "none\n",
+                "osnoise/per_cpu/cpu7/timerlat_fd": "",
+                "per_cpu/cpu7/stats": "entries: 0\noverrun: 0\n",
+            }
+            for relative, value in files.items():
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(value)
+
+            tracefs = TracefsTimerlat(root, 7, 10000, 64, cpu_idle_cpu=7)
+            tracefs.changed = True
+            (root / "current_tracer").write_text("timerlat\n")
+            (root / "tracing_on").write_text("1\n")
+            (root / "events/power/cpu_idle/enable").write_text("1\n")
+            (root / "events/power/cpu_idle/filter").write_text("cpu_id == 7\n")
+            (root / "trace").write_text("captured trace evidence\n")
+
+            real_write = timerlat_runner._write
+
+            def fail_filter_reset(path, value):
+                if path == root / "events/power/cpu_idle/filter" and value == "0":
+                    raise OSError(22, "invalid argument")
+                if path == root / "trace" and value == "":
+                    path.write_text("# entries-in-buffer/entries-written: 0/0 #P:8\n")
+                    return
+                real_write(path, value)
+
+            with mock.patch.object(timerlat_runner, "_write", side_effect=fail_filter_reset):
+                result = tracefs.stop_and_restore()
+
+        self.assertEqual(result["trace"], "captured trace evidence\n")
+        self.assertFalse(result["restored"])
+        self.assertTrue(
+            any("events/power/cpu_idle/filter" in error and "invalid argument" in error
+                for error in result["errors"])
+        )
 
     def test_trace_empty_requires_zero_entries_written(self):
         self.assertTrue(_empty_trace("# entries-in-buffer/entries-written: 0/0 #P:8\n"))
