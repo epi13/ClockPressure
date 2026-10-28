@@ -263,6 +263,7 @@ During late-campaign diagnostics, I opened `trace_pipe` shortly after a status p
 - The Linux v6.17 turbostat source migrates to the sampled CPU for local counter reads ([source](https://github.com/torvalds/linux/blob/v6.17/tools/power/x86/turbostat/turbostat.c)). The brief move did not isolate the observer. We removed the relocation option and changed instrumentation metadata to record affinity snapshots only. The test that had passed used a mocked process and did not model turbostat's own migration; that was a test-model gap.
 - These smokes do not measure latency, clock rate, observer effect, or elapsed time. The raw JSON and TSV hashes are listed in [the turbostat follow-up](TURBOSTAT_QOS_FOLLOWUP.md). Follow-up work should characterize another telemetry interface's CPU attribution and overhead before using it to claim a separated observer.
 - Read-only inspection after the smoke found `current_clocksource=tsc`, with `acpi_pm` also available, and per-CPU cpuidle `state0` through `state8` files on CPU 7. These are candidate interfaces for a source-dependence comparison and lower-overhead idle telemetry; neither observation establishes independent time or the behavior of a future experiment.
+- Added a reversible, randomized TSC/ACPI PM comparison runner with per-source campaign and restoration records plus a pair-level analyzer. It has not yet run on worker-03; the planned pilot and command are documented in [the clocksource pilot protocol](ACPI_PM_CLOCKSOURCE_PILOT.md).
 
 ## Findings ledger
 

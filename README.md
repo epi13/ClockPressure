@@ -46,6 +46,7 @@ An agent or program can satisfy what a test *measures* without satisfying what t
 | [Controlled timerlat findings](docs/TIMERLAT_CONTROLLED_FINDINGS.md) | Thirty-trial timerlat and pressure campaign with raw-trace integrity checks |
 | [CPU latency QoS findings](docs/CPU_LATENCY_QOS_FINDINGS.md) | Controlled 800-vs-default and 1,000-vs-800 µs idle-latency interventions, thermal stop, and integrity sensitivity results |
 | [Turbostat QoS follow-up](docs/TURBOSTAT_QOS_FOLLOWUP.md) | Five-replicate 30-second threshold comparison with aligned per-trial CPU/package telemetry and observer-effect caveats |
+| [TSC and ACPI PM pilot](docs/ACPI_PM_CLOCKSOURCE_PILOT.md) | Reversible, randomized clocksource pressure comparison with per-subcampaign restoration metadata |
 | [Sampler affinity follow-up](docs/SAMPLER_AFFINITY_FOLLOWUP.md) | Five-pair worker-03 sampler-pinned timer and cpuidle findings |
 | [Timerlat tracer smoke](docs/TIMERLAT_TRACING_SPIKE.md) | Built-in IRQ/thread tracer capability and per-CPU diagnostic |
 | [Contributing](CONTRIBUTING.md) | Contribution and review expectations |
