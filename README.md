@@ -9,9 +9,9 @@ ClockPressure is an open, Linux-focused experimental research project. It uses l
 - **Clock-rate error:** a reported clock advances at a different rate from a trustworthy external time reference.
 - **Contract / evaluation failure:** a test reports success because its measurement authority differs from the requirement being tested.
 
-**Status:** The initial executable instrumentation and synthetic timing-contract positive control are implemented. The first randomized worker-03 baseline/CPU-pressure campaign is complete. It showed a large timer-wakeup-latency change but no resolved pressure-related clock-rate change. No externally validated clock anomaly or natural false pass has been observed.
+**Status:** The executable instrumentation and synthetic timing-contract positive control are implemented. Three randomized worker-03 campaigns are complete. Four-core pressure repeatedly reduced timer-wakeup lateness by about 0.34 ms, including when the sampler was pinned to CPU 7 with zero migrations. Paired PHC cross-stamps showed no resolved pressure-related rate change. No externally validated clock anomaly or natural false pass has been observed.
 
-The measured result and its limits are recorded in [the initial worker-03 findings](docs/INITIAL_PILOT_FINDINGS.md). Raw worker data and regenerated analysis are preserved outside the repository at `/home/epi13/Documents/Projects/.clockpressure-data/worker-03/initial-campaign-20261028` and on worker-03 at `/home/worker-03/clockpressure-data/initial-campaign-20261028`.
+The first-campaign results are in [the initial worker-03 findings](docs/INITIAL_PILOT_FINDINGS.md), the cross-stamp and cpuidle follow-up is in [the second findings report](docs/CSTATE_CROSSSTAMP_FOLLOWUP.md), and sampler-placement results are in [the third findings report](docs/SAMPLER_AFFINITY_FOLLOWUP.md). Raw worker data and regenerated analysis are preserved outside the repository under `/home/epi13/Documents/Projects/.clockpressure-data/worker-03/` and on worker-03 under `/home/worker-03/clockpressure-data/`.
 
 ## Research question
 
@@ -40,6 +40,9 @@ An agent or program can satisfy what a test *measures* without satisfying what t
 | [Dependencies and provenance](docs/DEPENDENCIES.md) | Runtime requirements and imported-code provenance |
 | [Safety and research ethics](docs/SAFETY_AND_ETHICS.md) | Load ceilings, stop conditions, honest claims |
 | [Experimental journal](docs/EXPERIMENT_JOURNAL.md) | Implementation, worker execution and research findings kept separate |
+| [Paired cross-stamp follow-up](docs/CSTATE_CROSSSTAMP_FOLLOWUP.md) | Five-pair worker-03 PHC, timer and cpuidle findings |
+| [Sampler affinity follow-up](docs/SAMPLER_AFFINITY_FOLLOWUP.md) | Five-pair worker-03 sampler-pinned timer and cpuidle findings |
+| [Timerlat tracer smoke](docs/TIMERLAT_TRACING_SPIKE.md) | Built-in IRQ/thread tracer capability and per-CPU diagnostic |
 | [Contributing](CONTRIBUTING.md) | Contribution and review expectations |
 
 ## Planned phases
@@ -62,7 +65,7 @@ ClockPressure separates the native timing path, pressure generation, system inst
 - `instrumentation/sched_wakeup.bt` records the target process's kernel `sched_wakeup` to `sched_switch` interval using `bpftrace`/`bpf_ktime_get_ns`. It is contextual evidence in the kernel monotonic domain, not a separate clock.
 - `experiments/run_trial.py` captures the environment, low-rate thermal/frequency/PSI and per-CPU cpuidle residency context, clock-read gaps, raw samples, logs and checksums. It retains interrupted runs.
 - `experiments/run_campaign.py` runs an uninstrumented pressure-free baseline first, then seed-randomizes replicated baseline/CPU-pressure pairs, allows recovery and collects a recovery observation after every pressure run.
-- `analysis/analyze_runs.py` derives latency quantiles, internal and paired cross-timestamp rate comparisons, endpoint read-bracket bounds, environmental summaries and run-paired contrasts from retained raw runs.
+- `analysis/analyze_runs.py` derives latency quantiles, internal and paired cross-timestamp rate comparisons, endpoint read-bracket bounds, environmental summaries, per-CPU C10 residency, CPU migrations and run-paired contrasts from retained raw runs. `analysis/analyze_timerlat.py` summarizes retained Linux timerlat tracer output by CPU and pairs IRQ/thread records with optional userspace-return latency.
 
 On worker-03, from a checkout of the recorded revision:
 

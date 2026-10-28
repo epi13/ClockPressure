@@ -280,6 +280,13 @@ def _telemetry_summary(path: Path) -> dict[str, Any]:
             return None
         return values[-1] - values[0]
 
+    elapsed_ns = None
+    if len(records) >= 2:
+        first = records[0].get("monotonic_raw_ns_before")
+        last = records[-1].get("monotonic_raw_ns_before")
+        if isinstance(first, int) and isinstance(last, int) and last > first:
+            elapsed_ns = last - first
+    one_cpu_capacity_usec = elapsed_ns / 1000 if elapsed_ns else None
     idle_cpus = set.intersection(*idle_cpu_sets) if idle_cpu_sets else set()
 
     idle_by_cpu_state = {}
@@ -300,12 +307,16 @@ def _telemetry_summary(path: Path) -> dict[str, Any]:
         if usage_delta is not None:
             idle_usage_by_name[name] = idle_usage_by_name.get(name, 0) + int(usage_delta)
 
-    elapsed_ns = None
-    if len(records) >= 2:
-        first = records[0].get("monotonic_raw_ns_before")
-        last = records[-1].get("monotonic_raw_ns_before")
-        if isinstance(first, int) and isinstance(last, int) and last > first:
-            elapsed_ns = last - first
+    idle_pct_by_cpu_state_name: dict[str, dict[str, float]] = {}
+    if one_cpu_capacity_usec:
+        for key, state in idle_by_cpu_state.items():
+            time_delta = state.get("time_delta_usec")
+            if time_delta is None:
+                continue
+            cpu, _state_id = key.split("/", 1)
+            name = state["name"]
+            by_name = idle_pct_by_cpu_state_name.setdefault(cpu, {})
+            by_name[name] = by_name.get(name, 0.0) + time_delta / one_cpu_capacity_usec * 100
     cpu_capacity_usec = elapsed_ns / 1000 * len(idle_cpus) if elapsed_ns and idle_cpus else None
     idle_pct_by_name = {
         name: (time_delta / cpu_capacity_usec * 100)
@@ -335,6 +346,7 @@ def _telemetry_summary(path: Path) -> dict[str, Any]:
         "cpu_idle_residency_delta_usec_by_cpu_state": idle_by_cpu_state,
         "cpu_idle_residency_delta_usec_by_state_name": idle_time_by_name,
         "cpu_idle_usage_delta_by_state_name": idle_usage_by_name,
+        "cpu_idle_residency_pct_by_cpu_state_name": idle_pct_by_cpu_state_name,
         "cpu_idle_residency_pct_of_cpu_capacity_by_state_name": idle_pct_by_name,
     }
 
@@ -525,24 +537,70 @@ def _paired_contrasts(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     campaigns = sorted({run["campaign_id"] for run in runs if run.get("campaign_id")})
     contrasts = []
     for campaign_id in campaigns:
-        pressure_differences: dict[str, list[float]] = {"none": [], "sched_bpf": []}
+        differences: dict[tuple[str, str, str], list[float]] = {}
         observer_differences: dict[str, list[float]] = {
             "baseline": [], "cpu_pressure": [], "recovery": []
         }
-        replicates = {
+        replicates = sorted({
             run.get("replicate")
             for run in runs
             if run.get("campaign_id") == campaign_id and run.get("replicate") is not None
-        }
+        })
         for replicate in replicates:
             for observer in ("none", "sched_bpf"):
                 baseline = indexed.get((campaign_id, replicate, "baseline", observer))
-                pressure = indexed.get((campaign_id, replicate, "cpu_pressure", observer))
-                if baseline and pressure:
-                    before = baseline["wakeup_lateness_ns"].get("p99")
-                    after = pressure["wakeup_lateness_ns"].get("p99")
-                    if before is not None and after is not None:
-                        pressure_differences[observer].append(after - before)
+                for condition, contrast_name in (
+                    ("cpu_pressure", "cpu_pressure_minus_baseline"),
+                    ("recovery", "recovery_minus_baseline"),
+                ):
+                    treatment = indexed.get((campaign_id, replicate, condition, observer))
+                    if not baseline or not treatment:
+                        continue
+                    for metric, unit, extract in (
+                        (
+                            "run_p99_wakeup_lateness",
+                            "ns",
+                            lambda run: run.get("wakeup_lateness_ns", {}).get("p99"),
+                        ),
+                        (
+                            "adjacent_sample_cpu_migrations",
+                            "count",
+                            lambda run: run.get("sample_cpu_migrations_between_adjacent_samples"),
+                        ),
+                        (
+                            "paired_crossstamp_time_series_rate_difference",
+                            "ppm",
+                            lambda run: (run.get("paired_crossstamp_dynamics") or {}).get(
+                                "least_squares_rate_difference_ppm"
+                            ),
+                        ),
+                        (
+                            "cpu_c10_idle_residency",
+                            "percentage_points",
+                            lambda run: run.get("environment_telemetry", {})
+                            .get("cpu_idle_residency_pct_of_cpu_capacity_by_state_name", {})
+                            .get("C10"),
+                        ),
+                    ):
+                        before = extract(baseline)
+                        after = extract(treatment)
+                        if before is not None and after is not None:
+                            differences.setdefault(
+                                (contrast_name, observer, metric), []
+                            ).append(after - before)
+                    baseline_idle = baseline.get("environment_telemetry", {}).get(
+                        "cpu_idle_residency_pct_by_cpu_state_name", {}
+                    )
+                    treatment_idle = treatment.get("environment_telemetry", {}).get(
+                        "cpu_idle_residency_pct_by_cpu_state_name", {}
+                    )
+                    for cpu in sorted(set(baseline_idle) & set(treatment_idle)):
+                        before = baseline_idle[cpu].get("C10")
+                        after = treatment_idle[cpu].get("C10")
+                        if before is not None and after is not None:
+                            differences.setdefault(
+                                (contrast_name, observer, f"cpu_c10_idle_residency_{cpu}"), []
+                            ).append(after - before)
             for condition in ("baseline", "cpu_pressure", "recovery"):
                 unobserved = indexed.get((campaign_id, replicate, condition, "none"))
                 observed = indexed.get((campaign_id, replicate, condition, "sched_bpf"))
@@ -552,35 +610,48 @@ def _paired_contrasts(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     if before is not None and after is not None:
                         observer_differences[condition].append(after - before)
         seed_base = int(hashlib.sha256(campaign_id.encode()).hexdigest()[:8], 16)
-        for observer, differences in pressure_differences.items():
-            if differences:
-                contrasts.append(
-                    {
-                        "campaign_id": campaign_id,
-                        "contrast": "cpu_pressure_minus_baseline",
-                        "stratum": f"observer={observer}",
-                        "metric": "run_p99_wakeup_lateness_ns",
-                        "paired_difference_n": len(differences),
-                        "paired_difference_ns": _quantiles(differences),
-                        "paired_mean_difference_bootstrap_95_percent_interval_ns": _bootstrap_mean_interval(
-                            differences, seed_base + (observer == "sched_bpf")
-                        ),
-                        "interval_note": "descriptive paired-run resampling only; unavailable below three run pairs",
-                    }
-                )
+        for index, ((contrast_name, observer, metric), values) in enumerate(sorted(differences.items())):
+            unit = {
+                "run_p99_wakeup_lateness": "ns",
+                "adjacent_sample_cpu_migrations": "count",
+                "paired_crossstamp_time_series_rate_difference": "ppm",
+                "cpu_c10_idle_residency": "percentage_points",
+            }.get(metric, "percentage_points")
+            interval = _bootstrap_mean_interval(values, seed_base + index)
+            result = {
+                "campaign_id": campaign_id,
+                "contrast": contrast_name,
+                "stratum": f"observer={observer}",
+                "metric": metric,
+                "unit": unit,
+                "paired_difference_n": len(values),
+                "paired_difference": _quantiles(values),
+                "paired_mean_difference_bootstrap_95_percent_interval": interval,
+                "interval_note": "descriptive paired-run resampling only; unavailable below three run pairs",
+            }
+            # Preserve the original nanosecond keys for consumers of analysis.v1.
+            if unit == "ns":
+                result["paired_difference_ns"] = result["paired_difference"]
+                result["paired_mean_difference_bootstrap_95_percent_interval_ns"] = interval
+            contrasts.append(result)
         for condition, differences in observer_differences.items():
             if differences:
+                interval = _bootstrap_mean_interval(
+                    differences, seed_base + 100 + len(contrasts)
+                )
+                quantiles = _quantiles(differences)
                 contrasts.append(
                     {
                         "campaign_id": campaign_id,
                         "contrast": "sched_bpf_minus_no_observer",
                         "stratum": f"condition={condition}",
                         "metric": "run_p99_wakeup_lateness_ns",
+                        "unit": "ns",
                         "paired_difference_n": len(differences),
-                        "paired_difference_ns": _quantiles(differences),
-                        "paired_mean_difference_bootstrap_95_percent_interval_ns": _bootstrap_mean_interval(
-                            differences, seed_base + 2 + len(contrasts)
-                        ),
+                        "paired_difference": quantiles,
+                        "paired_mean_difference_bootstrap_95_percent_interval": interval,
+                        "paired_difference_ns": quantiles,
+                        "paired_mean_difference_bootstrap_95_percent_interval_ns": interval,
                         "interval_note": "descriptive paired-run resampling only; unavailable below three run pairs",
                     }
                 )
@@ -642,29 +713,36 @@ def _markdown(report: dict[str, Any]) -> str:
             "",
             "## Paired within-campaign contrasts",
             "",
-            "| Campaign | Contrast | Stratum | Matched replicates | Difference median (ns) | Descriptive 95% interval (ns) |",
-            "| --- | --- | --- | ---: | ---: | ---: |",
+            "| Campaign | Contrast | Stratum | Matched replicates | Metric | Median difference | Descriptive 95% interval |",
+            "| --- | --- | --- | ---: | --- | ---: | ---: |",
             *[
-                "| {campaign} | {contrast} | {stratum} | {n} | {median} | {ci} |".format(
+                "| {campaign} | {contrast} | {stratum} | {n} | {metric} ({unit}) | {median} | {ci} |".format(
                     campaign=contrast["campaign_id"],
                     contrast=contrast["contrast"],
                     stratum=contrast["stratum"],
                     n=contrast["paired_difference_n"],
-                    median=_fmt(contrast["paired_difference_ns"].get("median")),
+                    metric=contrast["metric"],
+                    unit=contrast.get("unit", "ns"),
+                    median=_fmt(
+                        (contrast.get("paired_difference") or contrast.get("paired_difference_ns", {})).get(
+                            "median"
+                        )
+                    ),
                     ci=(
-                        "{lo} to {hi}".format(
+                        "{lo} to {hi} {unit}".format(
                             lo=_fmt(
-                                contrast["paired_mean_difference_bootstrap_95_percent_interval_ns"].get(
+                                (contrast.get("paired_mean_difference_bootstrap_95_percent_interval") or contrast.get("paired_mean_difference_bootstrap_95_percent_interval_ns", {})).get(
                                     "lower_2_5_percent"
                                 )
                             ),
                             hi=_fmt(
-                                contrast["paired_mean_difference_bootstrap_95_percent_interval_ns"].get(
+                                (contrast.get("paired_mean_difference_bootstrap_95_percent_interval") or contrast.get("paired_mean_difference_bootstrap_95_percent_interval_ns", {})).get(
                                     "upper_97_5_percent"
                                 )
                             ),
+                            unit=contrast.get("unit", "ns"),
                         )
-                        if contrast["paired_mean_difference_bootstrap_95_percent_interval_ns"]
+                        if contrast.get("paired_mean_difference_bootstrap_95_percent_interval") or contrast.get("paired_mean_difference_bootstrap_95_percent_interval_ns")
                         else "not estimable (<3 pairs)"
                     ),
                 )
@@ -686,7 +764,7 @@ def _markdown(report: dict[str, Any]) -> str:
             "- The Intel e1000e PHC is a candidate separate hardware clock. This pilot does not establish oscillator independence, calibration uncertainty, or independent capture of the exact endpoints.",
             "- When available, `PTP_SYS_OFFSET_PRECISE` returns a driver-supported PHC/system cross-timestamp. Its paired rate result reduces userspace read-order ambiguity but remains an internal comparison with unquantified cross-timestamp accuracy; it is not an external standard.",
             "- The paired PHC/MONORAW offset fit uses all retained cross-timestamps. Its residual spread is descriptive; no confidence interval is reported because samples are serially correlated and driver cross-timestamp accuracy is unquantified.",
-            "- CPU C10 residency is the aggregate fraction of per-CPU capacity spent in the named cpuidle state. It does not expose package C-state residency or prove the cause of timer wakeup changes.",
+            "- Per-CPU C10 residency is each CPU's fraction of elapsed time in the named cpuidle state; the aggregate is across per-CPU capacity. Neither exposes package C-state residency or proves the cause of timer wakeup changes.",
             "- Endpoint read brackets are reported as conservative acquisition bounds; they are not calibration certificates or a complete uncertainty budget.",
             "- No external elapsed-time reference was acquired, so these data cannot establish physical clock drift or a hardware-caused false pass.",
             "- Raw JSONL, the per-run manifests, source revision and checksums are retained beside this analysis.",
@@ -698,7 +776,7 @@ def _markdown(report: dict[str, Any]) -> str:
 def _fmt(value: Any) -> str:
     if value is None:
         return "—"
-    return f"{value:.3f}" if isinstance(value, (float, int)) else str(value)
+    return f"{value:.6g}" if isinstance(value, (float, int)) else str(value)
 
 
 def analyze(data_dir: Path) -> dict[str, Any]:
