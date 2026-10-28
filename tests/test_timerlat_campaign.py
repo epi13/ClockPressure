@@ -190,7 +190,7 @@ class TestTracefsHelpers(unittest.TestCase):
 
             self.assertTrue(result["restored"])
             self.assertEqual((root / "events/power/cpu_idle/enable").read_text().strip(), "0")
-            self.assertEqual((root / "events/power/cpu_idle/filter").read_text().strip(), "none")
+            self.assertEqual((root / "events/power/cpu_idle/filter").read_text().strip(), "0")
             self.assertEqual((root / "current_tracer").read_text().strip(), "nop")
             self.assertEqual((root / "tracing_on").read_text().strip(), "1")
 

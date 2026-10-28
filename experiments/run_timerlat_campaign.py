@@ -165,9 +165,11 @@ class TracefsTimerlat:
         finally:
             if self.cpu_idle_cpu is not None:
                 idle_event = self.tracefs / "events/power/cpu_idle"
+                saved_filter = self.before["cpu_idle_event_filter"]
+                filter_reset = "0" if saved_filter in (None, "none", "") else saved_filter
                 for path, value in (
                     (idle_event / "enable", self.before["cpu_idle_event_enabled"] or "0"),
-                    (idle_event / "filter", self.before["cpu_idle_event_filter"] or "none"),
+                    (idle_event / "filter", filter_reset),
                 ):
                     try:
                         _write(path, value)
@@ -207,9 +209,13 @@ class TracefsTimerlat:
                     errors.append(exc)
             self.changed = False
 
-        after = self._settings()
-        restored = all(
-            after[key] == self.before[key]
+        after: dict[str, Any] = {}
+        try:
+            after = self._settings()
+        except Exception as exc:
+            errors.append(exc)
+        restored = bool(after) and all(
+            after.get(key) == self.before[key]
             for key in (
                 "current_tracer",
                 "tracing_on",
@@ -224,14 +230,11 @@ class TracefsTimerlat:
                 "trace_empty",
             )
         )
-        if errors:
-            raise RuntimeError(f"tracefs collection or restoration failed: {errors[0]}") from errors[0]
-        if not restored:
-            raise RuntimeError(f"tracefs state was not restored: before={self.before}, after={after}")
         return {
             "before": self.before,
             "after": after,
             "restored": restored,
+            "errors": [f"{type(error).__name__}: {error}" for error in errors],
             "cpu_buffer_stats": cpu_stats,
             "trace": trace,
         }
@@ -549,6 +552,13 @@ def _run_trial(
         if trace_session is not None:
             try:
                 trace_record = trace_session.stop_and_restore()
+                if trace_record.get("errors"):
+                    error = error or f"tracefs collection or restoration failed: {trace_record['errors'][0]}"
+                elif not trace_record.get("restored"):
+                    error = error or (
+                        "tracefs settings were not restored to their prior state: "
+                        f"before={trace_record.get('before')}, after={trace_record.get('after')}"
+                    )
             except Exception as exc:
                 error = error or f"tracefs restore: {type(exc).__name__}: {exc}"
         if qos_request is not None:
