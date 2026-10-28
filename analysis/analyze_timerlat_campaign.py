@@ -236,6 +236,8 @@ def build_report(
                 "replicate": replicate,
                 "arm": arm,
                 "condition": condition,
+                "trial_status": trial.get("status"),
+                "trial_error": trial.get("error"),
                 "run_id": run.get("run_id"),
                 "probe_samples": run.get("samples"),
                 "clockpressure_metrics": probe_metrics,
@@ -320,7 +322,9 @@ def build_report(
     return {
         "schema": "clockpressure.timerlat-campaign-analysis.v1",
         "campaign_id": campaign_id,
-        "campaign_status": campaign.get("status"),
+        "campaign_status": campaign.get("analysis_status", campaign.get("status")),
+        "campaign_recorded_status": campaign.get("status"),
+        "campaign_status_note": campaign.get("analysis_status_note"),
         "external_elapsed_time_reference": None,
         "clockrate_claim_allowed": False,
         "observer_effects": observer_effects,
@@ -344,6 +348,15 @@ def analyze_campaign(campaign_path: Path) -> dict[str, Any]:
     root = campaign_path.parent
     if campaign.get("schema") != "clockpressure.timerlat-campaign.v1":
         raise ValueError(f"unsupported campaign schema in {campaign_path}")
+    incomplete_trials = [
+        trial for trial in campaign.get("trials", []) if trial.get("status") != "complete"
+    ]
+    if campaign.get("status") == "complete" and incomplete_trials:
+        campaign["analysis_status"] = "failed"
+        campaign["analysis_status_note"] = (
+            "one or more trial records are not complete even though the stored campaign status is complete; "
+            "the analyzer treats this campaign as failed"
+        )
 
     probe_summaries: dict[tuple[str, int, str], dict[str, Any]] = {}
     arms = campaign.get("design", {}).get("arms") or ("timerlat_disabled", "timerlat_user")
@@ -488,7 +501,8 @@ def main() -> int:
     args = parser.parse_args()
     report = analyze_campaign(args.campaign)
     print(
-        f"analyzed campaign {report['campaign_id']} with {len(report['per_trial'])} completed records"
+        f"analyzed campaign {report['campaign_id']} with {len(report['per_trial'])} trial records "
+        f"(status: {report['campaign_status']})"
     )
     return 0
 

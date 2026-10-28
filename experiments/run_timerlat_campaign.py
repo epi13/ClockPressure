@@ -589,6 +589,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--buffer-kb", type=int, default=2048)
     parser.add_argument("--warmup-sec", type=float, default=5)
     parser.add_argument("--recovery-seconds", type=int, default=5)
+    parser.add_argument(
+        "--intertrial-cooldown-sec",
+        type=int,
+        default=0,
+        help="idle cooling interval after each completed trial",
+    )
     parser.add_argument("--seed", type=int)
     parser.add_argument("--host-alias", default="worker-03")
     parser.add_argument("--tracefs-root", default="/sys/kernel/tracing")
@@ -615,6 +621,8 @@ def run_campaign(args: argparse.Namespace) -> Path:
         raise ValueError("probe and timerlat user processes require separate CPUs")
     if args.recovery_seconds < 0 or args.recovery_seconds > 120:
         raise ValueError("--recovery-seconds must be in 0..120")
+    if args.intertrial_cooldown_sec < 0 or args.intertrial_cooldown_sec > 600:
+        raise ValueError("--intertrial-cooldown-sec must be in 0..600")
     if args.warmup_sec < 0 or args.warmup_sec > 30:
         raise ValueError("--warmup-sec must be in 0..30")
     if not 1 <= args.fifo_priority <= 99:
@@ -693,6 +701,7 @@ def run_campaign(args: argparse.Namespace) -> Path:
             "cpu_load_workers": args.cpu_load_workers,
             "fifo_priority": args.fifo_priority,
             "timerlat_buffer_kb": args.buffer_kb,
+            "intertrial_cooldown_sec": args.intertrial_cooldown_sec,
             "timerlat_arms": timerlat_arms,
             "cpu_dma_latency_intervention": power_intervention,
             "conditions": ["baseline", "cpu_pressure", "recovery"],
@@ -754,6 +763,12 @@ def run_campaign(args: argparse.Namespace) -> Path:
                 campaign["failure"] = entry.get("error", "trial failed")
                 break
             _write_json(campaign_path, campaign)
+            if ordinal < total and args.intertrial_cooldown_sec:
+                print(
+                    f"cooldown {args.intertrial_cooldown_sec}s before next trial",
+                    flush=True,
+                )
+                time.sleep(args.intertrial_cooldown_sec)
     except KeyboardInterrupt:
         campaign["status"] = "interrupted"
         campaign["failure"] = "received interrupt; active trial cleanup was attempted"
@@ -761,7 +776,8 @@ def run_campaign(args: argparse.Namespace) -> Path:
         campaign["status"] = "failed"
         campaign["failure"] = f"{type(exc).__name__}: {exc}"
     else:
-        campaign["status"] = "complete"
+        if campaign["status"] == "running":
+            campaign["status"] = "complete"
     campaign["finished_at_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     _write_json(campaign_path, campaign)
     print(campaign_path)

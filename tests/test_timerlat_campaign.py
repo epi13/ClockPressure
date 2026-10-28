@@ -1,4 +1,5 @@
 import hashlib
+import argparse
 import json
 import os
 import struct
@@ -8,6 +9,7 @@ from unittest import mock
 from pathlib import Path
 
 from analysis.analyze_timerlat_campaign import analyze_campaign, build_report
+import experiments.run_timerlat_campaign as timerlat_runner
 from experiments.run_timerlat_campaign import (
     CpuDmaLatencyRequest,
     _empty_trace,
@@ -175,6 +177,86 @@ class TestTracefsHelpers(unittest.TestCase):
             self.assertEqual(result["timerlat_activation_integrity"]["matched_irq_thread_activations"], 2)
             self.assertEqual(result["timerlat_buffer_stats"]["overrun"], 0)
             self.assertEqual(report["timerlat_integrity"]["trace_buffer_dropped_events"], 0)
+
+    def test_analyzer_flags_complete_manifest_with_failed_trial(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            campaign_path = root / "campaign.json"
+            campaign_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "clockpressure.timerlat-campaign.v1",
+                        "campaign_id": "misreported-failure",
+                        "status": "complete",
+                        "design": {
+                            "arms": ["timerlat_user"],
+                            "timerlat_arms": ["timerlat_user"],
+                        },
+                        "trials": [
+                            {
+                                "arm": "timerlat_user",
+                                "condition": "baseline",
+                                "replicate": 1,
+                                "status": "failed",
+                                "error": "thermal stop",
+                            }
+                        ],
+                    }
+                )
+            )
+
+            report = analyze_campaign(campaign_path)
+
+            self.assertEqual(report["campaign_status"], "failed")
+            self.assertEqual(report["campaign_recorded_status"], "complete")
+            self.assertEqual(report["per_trial"][0]["trial_status"], "failed")
+
+    def test_campaign_failure_is_not_overwritten_as_complete(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args = argparse.Namespace(
+                design="observer",
+                duration_sec=1,
+                period_us=100,
+                repeats=1,
+                cpu_load_workers=4,
+                load_cpus=[1, 2, 3, 4],
+                probe_cpu=6,
+                timerlat_cpu=7,
+                recovery_seconds=0,
+                warmup_sec=0,
+                fifo_priority=90,
+                buffer_kb=64,
+                seed=42,
+                host_alias="test-host",
+                tracefs_root="/tmp/tracefs-test",
+                cpu_dma_latency_path="/dev/cpu_dma_latency",
+                dma_latency_us=0,
+                intertrial_cooldown_sec=0,
+                data_dir=str(Path(temporary) / "campaign"),
+            )
+            tracefs = mock.MagicMock()
+            tracefs.before = {"current_tracer": "nop"}
+            with (
+                mock.patch.object(timerlat_runner.os, "geteuid", return_value=0),
+                mock.patch.object(timerlat_runner.os, "sched_getaffinity", return_value=set(range(8))),
+                mock.patch.object(timerlat_runner, "TracefsTimerlat", return_value=tracefs),
+                mock.patch.object(timerlat_runner, "snapshot_environment", return_value={}),
+                mock.patch.object(
+                    timerlat_runner.subprocess,
+                    "run",
+                    return_value=mock.Mock(stdout="deadbeef\n"),
+                ),
+                mock.patch.object(
+                    timerlat_runner,
+                    "_run_trial",
+                    return_value={"status": "failed", "error": "thermal stop"},
+                ),
+            ):
+                campaign_path = timerlat_runner.run_campaign(args)
+
+            campaign = json.loads(campaign_path.read_text())
+            self.assertEqual(campaign["status"], "failed")
+            self.assertEqual(campaign["trials"][0]["status"], "failed")
 
     def test_qos_campaign_compares_default_and_intervention_arms(self):
         campaign = {

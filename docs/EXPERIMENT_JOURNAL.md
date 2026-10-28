@@ -152,7 +152,7 @@ This journal separates implementation and test results from measurements perform
 - Added a root-only runner with randomized timerlat-enabled/disabled arms, randomized baseline/pressure order, recovery observations, per-trial tracefs state restoration and checksums. Added an analyzer that reparses retained traces, checks hashes and pairs timerlat activations with ClockPressure run outcomes.
 - Ran 30 trials on worker-03 at 30 seconds each, five replicates in each arm. The ClockPressure sampler ran on CPU 6, the SCHED_FIFO timerlat reader on CPU 7, and four lower-priority pressure workers on CPUs 1–4.
 - Raw data and generated analysis are preserved under the worker and local archive paths in [the findings report](TIMERLAT_CONTROLLED_FINDINGS.md). The analyzer reports 15/15 valid traces, 45,000 matched IRQ/thread activations and zero malformed, incomplete, duplicate, overrun or dropped records.
-- Added `cpu_latency_qos` campaign mode with a per-trial `/dev/cpu_dma_latency` request. It verifies the effective global value before, during and after the request and fails if normal close does not restore the prior value. The request lifecycle has a mocked unit test; worker smoke and full intervention campaign remain pending.
+- Added `cpu_latency_qos` campaign mode with a per-trial `/dev/cpu_dma_latency` request. It verifies the effective global value before, during and after the request and fails if normal close does not restore the prior value. The request lifecycle has a mocked unit test; a 0 µs smoke and a separate 800 µs smoke both restored the request and tracefs successfully.
 
 ### Observed
 
@@ -166,6 +166,21 @@ This journal separates implementation and test results from measurements perform
 - **Supports:** system pressure changes timer delivery and observed IRQ-context latency on this host under the tested policy.
 - **Does not support:** clock-rate error, physical elapsed-time error, a causal idle-state mechanism, or natural contract failure. The software timer positive control remains the only reproduced false pass.
 - **Next:** test whether PM QoS suppression of deep idle changes the pressure-associated latency reduction. The QoS design is an intervention on idle-exit policy, not a measurement of elapsed-time truth.
+
+## 2026-10-28 — QoS0 thermal stop and targeted QoS smoke
+
+### Observed and preserved
+
+- The first full QoS campaign used `cpu_dma_latency=0`, five intended replicates and the existing 85°C package stop threshold. It completed five trials, then stopped during trial 6 (a QoS0 baseline trial) after the package sensor reached 86°C. This is a partial campaign, not a completed comparison.
+- A runner control-flow defect incorrectly left the raw top-level manifest at `status: complete` after breaking on the failed trial. The failed per-trial record and thermal-stop error are preserved. The runner now keeps the failed status, and the analyzer detects this inconsistency in the unmodified raw manifest and reports the campaign as failed.
+- Raw data is preserved at `/home/worker-03/clockpressure-data/timerlat-cpu-latency-qos-20261028/` and `/home/epi13/Documents/Projects/.clockpressure-data/worker-03/timerlat-cpu-latency-qos-20261028/`. The completed trials and interrupted trial restored tracefs; each QoS request returned to the pre-existing 2,000,000,000 µs value. No higher thermal threshold was used.
+- Worker-03 reports 890 µs exit latency for C10. A six-trial, two-second `cpu_dma_latency=800` smoke then reduced measured C10 residency to zero on CPUs 6 and 7 while the request was held. All six traces passed checksums, with 1,200 matched IRQ/thread activations and no trace-buffer loss. Every request restored to 2,000,000,000 µs. The short smoke confirms intervention delivery, not a pressure effect.
+- The 800 µs smoke evidence is preserved at `/home/worker-03/clockpressure-data/timerlat-qos800-smoke-20261028/` and `/home/epi13/Documents/Projects/.clockpressure-data/worker-03/timerlat-qos800-smoke-20261028/`.
+
+### Method adjustment
+
+- The 0 µs request was broader than needed and triggered the thermal guard quickly. The full follow-up uses 800 µs to constrain states above the measured 890 µs C10 exit latency while leaving lower-latency states eligible. The runner now supports an idle cooldown after each trial; the planned full campaign uses 30 seconds between trials and 30 seconds before recovery. The 85°C stop threshold remains in force.
+- This policy can still change more than one idle state and does not establish that C10 alone is causal.
 
 ## Findings ledger
 
