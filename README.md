@@ -13,6 +13,8 @@ ClockPressure is an open, Linux-focused experimental research project. It uses l
 
 The first-campaign results are in [the initial worker-03 findings](docs/INITIAL_PILOT_FINDINGS.md), the cross-stamp and cpuidle follow-up is in [the second findings report](docs/CSTATE_CROSSSTAMP_FOLLOWUP.md), and sampler-placement results are in [the third findings report](docs/SAMPLER_AFFINITY_FOLLOWUP.md). Raw worker data and regenerated analysis are preserved outside the repository under `/home/epi13/Documents/Projects/.clockpressure-data/worker-03/` and on worker-03 under `/home/worker-03/clockpressure-data/`.
 
+The next controlled comparison separates timerlat IRQ/thread/user-return latency from ClockPressure's end-to-end wake lateness, with timerlat enabled and disabled in randomized baseline/pressure/recovery arms. See [the controlled timerlat campaign design](docs/TIMERLAT_CONTROLLED_CAMPAIGN.md); measurements are pending.
+
 ## Research question
 
 Can workload-induced system pressure, directly or through hardware / firmware / software dependencies, cause a measurable divergence between reported and independently observed elapsed time? If so, can that divergence produce a reproducible false pass in a timing contract?
@@ -66,6 +68,7 @@ ClockPressure separates the native timing path, pressure generation, system inst
 - `experiments/run_trial.py` captures the environment, low-rate thermal/frequency/PSI and per-CPU cpuidle residency context, clock-read gaps, raw samples, logs and checksums. It retains interrupted runs.
 - `experiments/run_campaign.py` runs an uninstrumented pressure-free baseline first, then seed-randomizes replicated baseline/CPU-pressure pairs, allows recovery and collects a recovery observation after every pressure run.
 - `analysis/analyze_runs.py` derives latency quantiles, internal and paired cross-timestamp rate comparisons, endpoint read-bracket bounds, environmental summaries, per-CPU C10 residency, CPU migrations and run-paired contrasts from retained raw runs. `analysis/analyze_timerlat.py` summarizes retained Linux timerlat tracer output by CPU and pairs IRQ/thread records with optional userspace-return latency.
+- `experiments/run_timerlat_campaign.py` manages a guarded tracefs timerlat user-read path beside the normal probe, compares enabled and disabled arms, and preserves tracefs restoration evidence. `analysis/analyze_timerlat_campaign.py` reports paired probe and timerlat latency contrasts without treating them as clock-rate measurements.
 
 On worker-03, from a checkout of the recorded revision:
 
