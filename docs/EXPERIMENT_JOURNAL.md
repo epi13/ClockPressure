@@ -226,6 +226,28 @@ During late-campaign diagnostics, I opened `trace_pipe` shortly after a status p
 - Add per-transition CPU idle state entry/exit events to timerlat runs on CPUs 6 and 7, then correlate each event with the immediately preceding state and idle duration.
 - Continue the search for an independently calibrated elapsed-time reference; no hardware clock-rate claim is supported yet.
 
+## 2026-10-28 — Timestamped power telemetry and threshold replication (in progress)
+
+### Implemented and validated
+
+- Added an in-campaign `turbostat` sampler rather than wrapping each workload command. A six-trial worker smoke at 0.5-second sampling produced 136 timestamped CPU rows over 33.32 seconds; each trial had 100 timerlat activations, all 600 CPU-idle joins succeeded, and trace buffers and settings were restored.
+- A separate earlier invocation that wrapped a long command produced only one aggregate summary after process exit (259.6 seconds), so it could not align telemetry with individual baseline, pressure and recovery windows. The output is preserved but excluded from per-condition interpretation.
+- Added analysis that filters the selected logical-CPU row and matches turbostat's `Time_Of_Day_Seconds` to the probe's host `CLOCK_REALTIME` start/end records. Per-trial counts and medians and replicate-paired telemetry contrasts are emitted; the raw TSV digest and observer process placement are retained. This same-host wall-clock join is for context, not independent elapsed-time evidence.
+- Added an optional observer-CPU relocation mode. It records affinity, nice value and scheduler policy before relocation, after relocation and at shutdown, allowing future captures to move the sampler away from the measured CPU and verify that placement.
+- The relocation behavior is covered by mocked unit tests; it has not yet been applied on worker-03. The full local `make check` suite passes 36 checks, including native probe integration and the turbostat alignment/report fixture.
+
+### Observed during the active worker campaign
+
+- Campaign `20261028T073611Z-timerlat-campaign-21325dbd` compares 800 µs and 1,000 µs CPU-latency QoS targets, with five randomized replicates, 30-second baseline/pressure/recovery observations, four pressure workers on CPUs 1–4, the probe on CPU 6 and timerlat on CPU 7. The raw directory is `/home/worker-03/clockpressure-data/timerlat-idle-qos-800-vs1000-turbostat-5x30-20261028/`.
+- At this journal update, 15 of 30 trials were complete. Every completed trial had zero timerlat trace-buffer overrun/commit-overrun/dropped-event counts, and the campaign remained active; no treatment result is reported here.
+- Inspection of the running turbostat process showed its affinity restricted to CPU 7 with nice value −20 and `SCHED_OTHER`, colocating the telemetry observer with the timerlat reader. This is a material observer condition. The current campaign remains useful as an explicitly turbostat-instrumented comparison, but its timerlat latency results cannot be generalized to an uninstrumented run. Follow-up collection will move the sampler to a separate online CPU and record the actual affinity.
+
+### Measurement limits and next
+
+- Per-second frequency, C10 residency, package power and temperature can show that pressure changes hardware state, but they do not establish a causal path to timer delivery or elapsed-time accuracy. `Pkg%pc6` and `Pk%pc10` were zero in earlier idle and pressure captures, so they are not used to infer package-state entry.
+- Finish this campaign without changing its instrumentation, reparse and checksum all traces, archive the raw artifacts and compare the idle-policy contrasts with the previous 2×10-second threshold campaign. Then validate observer relocation in a short worker smoke and decide whether a matched collector-placement study is warranted.
+- No calibrated external elapsed-time reference is part of this design; even a reproducible latency or clock-interface contrast is not a physical timing-contract failure.
+
 ## Findings ledger
 
 | Claim | Evidence label | Current status |

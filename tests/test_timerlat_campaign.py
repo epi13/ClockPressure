@@ -8,7 +8,12 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from analysis.analyze_timerlat_campaign import analyze_campaign, build_report
+from analysis.analyze_timerlat_campaign import (
+    analyze_campaign,
+    analyze_turbostat_capture,
+    build_report,
+    _markdown,
+)
 import experiments.run_timerlat_campaign as timerlat_runner
 from experiments.run_timerlat_campaign import (
     CpuDmaLatencyRequest,
@@ -22,6 +27,97 @@ from experiments.run_timerlat_campaign import (
 
 
 class TestTimerlatCampaignAnalysis(unittest.TestCase):
+    def test_turbostat_capture_joins_cpu_samples_to_probe_realtime_window(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run = root / "runs" / "timerlat_user" / "run-1"
+            run.mkdir(parents=True)
+            (run / "probe.jsonl").write_text(
+                '\n'.join(
+                    json.dumps(record)
+                    for record in (
+                        {"kind": "start", "realtime_ns": 100_000_000_000},
+                        {"kind": "sample", "realtime_ns": 102_000_000_000},
+                        {"kind": "end", "realtime_ns": 104_000_000_000},
+                    )
+                )
+                + "\n"
+            )
+            header = "Time_Of_Day_Seconds\tCore\tCPU\tBusy%\tBzy_MHz\tC10%\tPkgTmp\tPkgWatt"
+            lines = [
+                header,
+                "99\t-\t-\t99\t9999\t0\t90\t100",
+                "99\t7\t7\t1\t1000\t90\t40\t4",
+                header,
+                "100\t7\t7\t2\t2000\t80\t41\t5",
+                header,
+                "101\t7\t7\t4\t3000\t70\t42\t6",
+                "103\t7\t7\t6\t4000\t60\t43\t7",
+                header,
+                "104\t7\t7\t8\t5000\t50\t44\t8",
+                "105\t7\t7\t99\t9999\t0\t90\t100",
+            ]
+            (root / "turbostat.tsv").write_text("\n".join(lines) + "\n")
+            campaign = {
+                "campaign_id": "turbostat-fixture",
+                "status": "complete",
+                "design": {"timerlat_cpu": 7, "arms": ["timerlat_user"]},
+                "turbostat_capture": {
+                    "status": "stopped",
+                    "cpu": 7,
+                    "interval_seconds": 1.0,
+                    "output": "turbostat.tsv",
+                },
+                "trials": [
+                    {
+                        "arm": "timerlat_user",
+                        "replicate": 1,
+                        "condition": "baseline",
+                        "run_dir": "runs/timerlat_user/run-1",
+                    },
+                    {
+                        "arm": "timerlat_user",
+                        "replicate": 1,
+                        "condition": "cpu_pressure",
+                    },
+                ],
+            }
+
+            capture, summaries = analyze_turbostat_capture(root, campaign)
+
+        summary = summaries[("timerlat_user", 1, "baseline")]
+        self.assertEqual(capture["parsed_cpu_sample_count"], 6)
+        self.assertEqual(capture["parser_diagnostics"]["header_rows"], 4)
+        self.assertEqual(summary["status"], "aligned")
+        self.assertEqual(summary["sample_count"], 4)
+        self.assertEqual(summary["metrics"]["Busy%"]["median"], 5)
+        self.assertEqual(summary["metrics"]["PkgWatt"]["median"], 6.5)
+        self.assertIn("not an independent elapsed-time reference", summary["join_limit"])
+        pressure_summary = {
+            "status": "aligned",
+            "sample_count": 4,
+            "metrics": {"PkgTmp": {"median": 52.0}},
+        }
+        report = build_report(
+            campaign,
+            {},
+            {},
+            capture,
+            {**summaries, ("timerlat_user", 1, "cpu_pressure"): pressure_summary},
+        )
+        self.assertEqual(
+            report["per_trial"][0]["turbostat_cpu_telemetry"]["sample_count"],
+            4,
+        )
+        temp_contrast = next(
+            item
+            for item in report["paired_contrasts"]
+            if item["metric"] == "turbostat_cpu_PkgTmp_median"
+            and item["contrast"] == "pressure_minus_baseline"
+        )
+        self.assertEqual(temp_contrast["paired_difference"]["median"], 9.5)
+        self.assertIn("Turbostat CPU telemetry", _markdown(report))
+
     def test_pairs_probe_and_timerlat_metrics_by_arm_and_replicate(self):
         campaign = {
             "campaign_id": "fixture-campaign",
@@ -139,6 +235,59 @@ class TestTimerlatCampaignAnalysis(unittest.TestCase):
 
 
 class TestTracefsHelpers(unittest.TestCase):
+    def test_turbostat_sampler_records_and_applies_isolated_observer_cpu(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "turbostat.tsv"
+            fake_process = mock.Mock()
+            fake_process.pid = 4243
+            fake_process.poll.return_value = None
+            fake_process.wait.return_value = 130
+
+            def fake_popen(command, **_kwargs):
+                Path(command[command.index("--out") + 1]).write_text(
+                    "Time_Of_Day_Seconds\tCPU\n1793172000.0\t7\n"
+                )
+                return fake_process
+
+            sampler = TurbostatSampler(
+                output,
+                cpu=7,
+                interval_sec=0.5,
+                observer_cpu=0,
+            )
+            with (
+                mock.patch.object(timerlat_runner.shutil, "which", return_value="/usr/bin/turbostat"),
+                mock.patch.object(timerlat_runner.subprocess, "Popen", side_effect=fake_popen),
+                mock.patch.object(timerlat_runner.os, "killpg"),
+                mock.patch.object(timerlat_runner.os, "sched_setaffinity") as set_affinity,
+                mock.patch.object(
+                    timerlat_runner.os,
+                    "sched_getaffinity",
+                    side_effect=[{7}, {0}, {0}],
+                ),
+                mock.patch.object(timerlat_runner.os, "getpriority", return_value=-20),
+                mock.patch.object(
+                    timerlat_runner.os,
+                    "sched_getscheduler",
+                    return_value=timerlat_runner.os.SCHED_OTHER,
+                ),
+                mock.patch.object(
+                    timerlat_runner.os,
+                    "sched_getparam",
+                    return_value=mock.Mock(sched_priority=0),
+                ),
+            ):
+                sampler.start()
+                record = sampler.stop()
+
+        set_affinity.assert_called_once_with(4243, {0})
+        self.assertEqual(record["observer_cpu_requested"], 0)
+        self.assertEqual(record["observer_process_state_before_move"]["affinity_cpus"], [7])
+        self.assertEqual(record["observer_process_state"]["affinity_cpus"], [0])
+        self.assertEqual(record["observer_process_state_at_stop"]["affinity_cpus"], [0])
+        self.assertEqual(record["observer_process_state"]["nice"], -20)
+        self.assertEqual(record["observer_process_state"]["scheduler_policy"], "SCHED_OTHER")
+
     def test_turbostat_sampler_waits_for_timestamped_data_and_stops_cleanly(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "turbostat.tsv"

@@ -113,16 +113,55 @@ _TURBOSTAT_FIELDS = (
 class TurbostatSampler:
     """Capture package and selected-CPU counters while a campaign runs."""
 
-    def __init__(self, output_path: Path, *, cpu: int, interval_sec: float):
+    def __init__(
+        self,
+        output_path: Path,
+        *,
+        cpu: int,
+        interval_sec: float,
+        observer_cpu: int | None = None,
+    ):
         self.output_path = output_path
         self.stderr_path = output_path.with_suffix(".stderr")
         self.cpu = cpu
         self.interval_sec = interval_sec
+        self.observer_cpu = observer_cpu
         self.binary: str | None = None
         self.process: subprocess.Popen[bytes] | None = None
         self.stderr_stream = None
         self.started_at_utc: str | None = None
         self.stopped_at_utc: str | None = None
+        self.observer_process_state_before_move: dict[str, Any] | None = None
+        self.observer_process_state: dict[str, Any] | None = None
+
+    def _process_state(self) -> dict[str, Any]:
+        if self.process is None:
+            return {"available": False, "reason": "process was not started"}
+        pid = self.process.pid
+        try:
+            affinity = sorted(os.sched_getaffinity(pid))
+            nice = os.getpriority(os.PRIO_PROCESS, pid)
+            policy = os.sched_getscheduler(pid)
+            priority = os.sched_getparam(pid).sched_priority
+        except OSError as exc:
+            return {
+                "available": False,
+                "pid": pid,
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+        policy_names = {
+            os.SCHED_OTHER: "SCHED_OTHER",
+            os.SCHED_FIFO: "SCHED_FIFO",
+            os.SCHED_RR: "SCHED_RR",
+        }
+        return {
+            "available": True,
+            "pid": pid,
+            "affinity_cpus": affinity,
+            "nice": nice,
+            "scheduler_policy": policy_names.get(policy, str(policy)),
+            "scheduler_priority": priority,
+        }
 
     def _has_sample(self) -> bool:
         try:
@@ -171,12 +210,22 @@ class TurbostatSampler:
                     f"turbostat exited before producing a sample (return code={self.process.returncode})"
                 )
             if self._has_sample():
+                self.observer_process_state_before_move = self._process_state()
+                if self.observer_cpu is not None:
+                    try:
+                        os.sched_setaffinity(self.process.pid, {self.observer_cpu})
+                    except OSError as exc:
+                        raise RuntimeError(
+                            f"could not place turbostat observer on CPU {self.observer_cpu}: {exc}"
+                        ) from exc
+                self.observer_process_state = self._process_state()
                 return
             time.sleep(0.1)
         raise RuntimeError("turbostat did not produce a timestamped sample within 10 seconds")
 
     def stop(self) -> dict[str, Any]:
         return_code: int | None = None
+        observer_process_state_at_stop = self._process_state()
         if self.process is not None:
             if self.process.poll() is None:
                 try:
@@ -219,6 +268,10 @@ class TurbostatSampler:
             "returncode": return_code,
             "expected_stop_returncodes": [0, -signal.SIGINT, 128 + signal.SIGINT],
             "output_bytes": self.output_path.stat().st_size if self.output_path.exists() else 0,
+            "observer_cpu_requested": self.observer_cpu,
+            "observer_process_state_before_move": self.observer_process_state_before_move,
+            "observer_process_state": self.observer_process_state or self._process_state(),
+            "observer_process_state_at_stop": observer_process_state_at_stop,
         }
 
 
@@ -881,9 +934,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--capture-turbostat",
         action="store_true",
-        help="sample CPU7/package residency, frequency, power, and temperature during the campaign",
+        help="sample selected-CPU/package residency, frequency, power, and temperature during the campaign",
     )
     parser.add_argument("--turbostat-cpu", type=int)
+    parser.add_argument(
+        "--turbostat-observer-cpu",
+        type=int,
+        help="move the turbostat sampler to this CPU after its first sample; separate it from the measured CPU",
+    )
     parser.add_argument("--turbostat-interval-sec", type=float, default=1.0)
     parser.add_argument("--warmup-sec", type=float, default=5)
     parser.add_argument("--recovery-seconds", type=int, default=5)
@@ -910,6 +968,7 @@ def build_parser() -> argparse.ArgumentParser:
 def run_campaign(args: argparse.Namespace) -> Path:
     args.capture_turbostat = getattr(args, "capture_turbostat", False)
     args.turbostat_cpu = getattr(args, "turbostat_cpu", None)
+    args.turbostat_observer_cpu = getattr(args, "turbostat_observer_cpu", None)
     args.turbostat_interval_sec = getattr(args, "turbostat_interval_sec", 1.0)
     if os.geteuid() != 0:
         raise RuntimeError("tracefs timerlat collection requires root; run under sudo")
@@ -933,6 +992,8 @@ def run_campaign(args: argparse.Namespace) -> Path:
         raise ValueError("--warmup-sec must be in 0..30")
     if not 0.1 <= args.turbostat_interval_sec <= 60:
         raise ValueError("--turbostat-interval-sec must be in 0.1..60")
+    if args.turbostat_observer_cpu is not None and not args.capture_turbostat:
+        raise ValueError("--turbostat-observer-cpu requires --capture-turbostat")
     if not 1 <= args.fifo_priority <= 99:
         raise ValueError("--fifo-priority must be in 1..99")
     if not 0 <= args.dma_latency_us <= 2_000_000_000:
@@ -952,6 +1013,10 @@ def run_campaign(args: argparse.Namespace) -> Path:
     turbostat_cpu = args.turbostat_cpu if args.turbostat_cpu is not None else args.timerlat_cpu
     if args.capture_turbostat and turbostat_cpu not in online_cpus:
         raise ValueError(f"turbostat CPU {turbostat_cpu} must be online")
+    if args.turbostat_observer_cpu is not None and args.turbostat_observer_cpu not in online_cpus:
+        raise ValueError(
+            f"turbostat observer CPU {args.turbostat_observer_cpu} must be online"
+        )
     if not TRIAL.is_file() or not TIMERLAT_WORKER.is_file():
         raise RuntimeError("ClockPressure trial or timerlat user worker is missing")
     if not (ROOT / "build" / "clockpressure-probe").is_file():
@@ -1051,6 +1116,7 @@ def run_campaign(args: argparse.Namespace) -> Path:
             "turbostat": (
                 {
                     "cpu": args.turbostat_cpu if args.turbostat_cpu is not None else args.timerlat_cpu,
+                    "observer_cpu_requested": args.turbostat_observer_cpu,
                     "interval_seconds": args.turbostat_interval_sec,
                     "fields": _TURBOSTAT_FIELDS.split(","),
                     "timestamp_semantics": "wall-clock label for alignment; not an independent elapsed-time reference",
@@ -1103,12 +1169,14 @@ def run_campaign(args: argparse.Namespace) -> Path:
             out / "turbostat.tsv",
             cpu=turbostat_cpu,
             interval_sec=args.turbostat_interval_sec,
+            observer_cpu=args.turbostat_observer_cpu,
         )
         campaign["turbostat_capture"] = {
             "status": "starting",
             "output": "turbostat.tsv",
             "stderr": "turbostat.stderr",
             "cpu": turbostat_cpu,
+            "observer_cpu_requested": args.turbostat_observer_cpu,
             "interval_seconds": args.turbostat_interval_sec,
             "fields": _TURBOSTAT_FIELDS.split(","),
         }
@@ -1119,6 +1187,12 @@ def run_campaign(args: argparse.Namespace) -> Path:
             campaign["turbostat_capture"]["status"] = "running"
             campaign["turbostat_capture"]["started_at_utc"] = (
                 turbostat_sampler.started_at_utc
+            )
+            campaign["turbostat_capture"]["observer_process_state"] = (
+                turbostat_sampler.observer_process_state
+            )
+            campaign["turbostat_capture"]["observer_process_state_before_move"] = (
+                turbostat_sampler.observer_process_state_before_move
             )
             _write_json(campaign_path, campaign)
         for ordinal, (replicate, arm, condition, role) in enumerate(plan, start=1):
