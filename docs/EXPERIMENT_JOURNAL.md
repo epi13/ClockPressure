@@ -121,8 +121,8 @@ This journal separates implementation and test results from measurements perform
 ### Next
 
 1. ~~Inspect worker-03 timer and IRQ tracepoints and available timer-latency tracing.~~ Completed: the `timerlat` tracefs tracer produced paired IRQ/thread events; see [the timerlat tracer smoke report](TIMERLAT_TRACING_SPIKE.md).
-2. Compare controlled baseline/pressure/recovery runs with timerlat enabled and disabled; retain the ClockPressure end-to-end outcome and account for the tracer's high-priority per-CPU workload.
-3. Continue seeking a calibrated, independently captured elapsed-time reference. Current PHC cross-stamps remain internal evidence only.
+2. ~~Compare controlled baseline/pressure/recovery runs with timerlat enabled and disabled.~~ Completed with five paired replicates per arm; see [the controlled timerlat findings](TIMERLAT_CONTROLLED_FINDINGS.md).
+3. Compare default CPU idle-latency policy with a temporary global CPU DMA latency QoS constraint, then continue seeking an independently calibrated elapsed-time reference.
 
 ## 2026-10-28 — Kernel timerlat tracefs smoke
 
@@ -142,9 +142,89 @@ This journal separates implementation and test results from measurements perform
 
 ### Next
 
-1. Repeat baseline/pressure/recovery with the pinned userspace timerlat interface, paired with tracer-disabled controls and ClockPressure's own end-to-end wake lateness.
-2. Measure the interface's observer effect and compare IRQ, thread and user-return stages; do not treat it as an independent clock.
-3. Keep any hardware-time claim gated on an independently calibrated elapsed-time reference.
+1. Test whether a temporary global CPU idle-exit latency constraint changes the timerlat and ClockPressure pressure response.
+2. Keep any hardware-time claim gated on an independently calibrated elapsed-time reference.
+
+## 2026-10-28 — Controlled timerlat and pressure campaign
+
+### Implemented and executed
+
+- Added a root-only runner with randomized timerlat-enabled/disabled arms, randomized baseline/pressure order, recovery observations, per-trial tracefs state restoration and checksums. Added an analyzer that reparses retained traces, checks hashes and pairs timerlat activations with ClockPressure run outcomes.
+- Ran 30 trials on worker-03 at 30 seconds each, five replicates in each arm. The ClockPressure sampler ran on CPU 6, the SCHED_FIFO timerlat reader on CPU 7, and four lower-priority pressure workers on CPUs 1–4.
+- Raw data and generated analysis are preserved under the worker and local archive paths in [the findings report](TIMERLAT_CONTROLLED_FINDINGS.md). The analyzer reports 15/15 valid traces, 45,000 matched IRQ/thread activations and zero malformed, incomplete, duplicate, overrun or dropped records.
+- Added `cpu_latency_qos` campaign mode with a per-trial `/dev/cpu_dma_latency` request. It verifies the effective global value before, during and after the request and fails if normal close does not restore the prior value. The request lifecycle has a mocked unit test; a 0 µs smoke and a separate 800 µs smoke both restored the request and tracefs successfully.
+
+### Observed
+
+- Pressure reduced ClockPressure wake-lateness P99 by median 340.575 µs with timerlat disabled and 327.256 µs with it enabled. In the enabled arm, timerlat IRQ/thread/user-return P99s fell by 315.647/328.228/364.604 µs.
+- Same-host PHC/MONORAW fitted rate contrasts include zero in both arms. These measurements do not establish absolute clock accuracy or external elapsed-time agreement.
+- Aggregate C10 residency fell about 45 percentage points as the four worker CPUs became busy. C10 residency rose slightly on the probe and timerlat CPUs even as their measured P99 latency fell; this does not support the simple per-CPU deep-idle explanation.
+- Timerlat observation shifted baseline wake P99 by about −16.2 µs; the enabled/disabled contrasts under pressure and recovery include zero. This is a combined observer effect from trace instrumentation and the pinned FIFO reader.
+
+### Status and next hypothesis
+
+- **Supports:** system pressure changes timer delivery and observed IRQ-context latency on this host under the tested policy.
+- **Does not support:** clock-rate error, physical elapsed-time error, a causal idle-state mechanism, or natural contract failure. The software timer positive control remains the only reproduced false pass.
+- **Next:** completed the PM QoS intervention; see [the controlled QoS findings](CPU_LATENCY_QOS_FINDINGS.md). The QoS design tests idle-exit policy, not elapsed-time truth.
+
+## 2026-10-28 — QoS0 thermal stop and targeted QoS smoke
+
+### Observed and preserved
+
+- The first full QoS campaign used `cpu_dma_latency=0`, five intended replicates and the existing 85°C package stop threshold. It completed five trials, then stopped during trial 6 (a QoS0 baseline trial) after the package sensor reached 86°C. This is a partial campaign, not a completed comparison.
+- A runner control-flow defect incorrectly left the raw top-level manifest at `status: complete` after breaking on the failed trial. The failed per-trial record and thermal-stop error are preserved. The runner now keeps the failed status, and the analyzer detects this inconsistency in the unmodified raw manifest and reports the campaign as failed.
+- Raw data is preserved at `/home/worker-03/clockpressure-data/timerlat-cpu-latency-qos-20261028/` and `/home/epi13/Documents/Projects/.clockpressure-data/worker-03/timerlat-cpu-latency-qos-20261028/`. The completed trials and interrupted trial restored tracefs; each QoS request returned to the pre-existing 2,000,000,000 µs value. No higher thermal threshold was used.
+- Worker-03 reports 890 µs exit latency for C10. A six-trial, two-second `cpu_dma_latency=800` smoke then reduced measured C10 residency to zero on CPUs 6 and 7 while the request was held. All six traces passed checksums, with 1,200 matched IRQ/thread activations and no trace-buffer loss. Every request restored to 2,000,000,000 µs. The short smoke confirms intervention delivery, not a pressure effect.
+- The 800 µs smoke evidence is preserved at `/home/worker-03/clockpressure-data/timerlat-qos800-smoke-20261028/` and `/home/epi13/Documents/Projects/.clockpressure-data/worker-03/timerlat-qos800-smoke-20261028/`.
+
+### Method adjustment
+
+- The 0 µs request was broader than needed and triggered the thermal guard quickly. The follow-up used 800 µs to constrain states above the measured 890 µs C10 exit latency while leaving lower-latency states eligible. The completed campaign used 30 seconds between trials and 30 seconds before recovery. The 85°C stop threshold remained in force; maximum package temperature was 77°C.
+- This policy can still change more than one idle state and does not establish that C10 alone is causal.
+
+## 2026-10-28 — CPU latency QoS paired campaign
+
+### Implemented and executed
+
+- Added C9 residency metrics and paired difference-in-differences analysis for the QoS intervention. The analyzer reports campaign integrity, trace loss, checksums, request restoration and raw trial status.
+- Completed 30 randomized trials: five replicates each of default and 800 µs QoS arms, each with baseline, pressure and recovery. The campaign used 30-second per-trial cooldowns and a 30-second wait before recovery.
+- Raw data and analysis are preserved under worker-03 `/home/worker-03/clockpressure-data/timerlat-cpu-latency-qos-800us-20261028/` and the local archive. All 30 traces passed checksums; 90,000 IRQ/thread activations matched, all QoS requests and tracefs state restored, and there were zero buffer overruns or dropped events.
+
+### Observed
+
+- The 800 µs target removed C10 residency on probe CPU 6 and timerlat CPU 7, shifting most measured idle residency into C9. At baseline it reduced ClockPressure wake P99 by about 105 µs and timerlat IRQ/thread/user-return P99 by about 105 µs compared with the default policy.
+- Pressure still reduced wake P99 by 225.5 µs under QoS800 (versus 326.4 µs under the default policy). Timerlat IRQ/thread/user-return reductions remained 195/209/253 µs. The QoS intervention attenuated those timerlat pressure effects by about 105 µs each, but did not eliminate them.
+- With the default policy, pressure reduced timerlat latency while C10 residency on CPUs 6 and 7 rose slightly. This counters the simple claim that pressure improved latency by keeping those CPUs out of C10. The QoS intervention supports a partial idle-exit-policy contribution at baseline, but several idle states and systemwide policy effects are coupled.
+- The `PTP_SYS_OFFSET_PRECISE` fit yielded an approximately 0.12 ppb QoS-by-pressure interaction, but the preceding timerlat campaign had a pressure residual of the opposite sign. The fit residual is about 41 ns over a 30-second window and serial correlation/capture uncertainty are not modeled. This is an exploratory same-host residual, not evidence of physical clock error.
+
+### Next
+
+- ~~Compare explicit 800 µs and 1,000 µs requests, straddling the measured 890 µs C10 exit latency.~~ Completed in the threshold follow-up below.
+- Seek an independently calibrated elapsed-time reference before making a hardware-time claim.
+
+## 2026-10-28 — Explicit C10 eligibility-threshold follow-up
+
+### Implemented and executed
+
+- Extended the timerlat campaign design to keep an explicit 1,000 µs QoS request in the control arm while comparing an 800 µs intervention. This distinguishes crossing the measured 890 µs C10 exit-latency threshold from simply having an active request.
+- Completed campaign `20261028T061004Z-timerlat-campaign-989b334f` at code revision `e03c69b`: five randomized replicates per arm/condition, 30 seconds per observation, four pinned pressure workers, timerlat on CPU 7, probe on CPU 6, 30-second cooldowns and recovery waits.
+- Preserved raw data and analysis on worker-03 at `/home/worker-03/clockpressure-data/timerlat-c10-threshold-20261028/` and locally under `.clockpressure-data/worker-03/timerlat-c10-threshold-20261028/`. All 30 trials completed. The 30 traces passed checksum/reparse checks; 90,000 IRQ/thread pairs matched with 89,970 user-return records and no incomplete pairs, malformed lines, overruns or dropped events. Every QoS request and tracefs state restored. Maximum package temperature was 77°C.
+
+### Observed
+
+- With the 1,000 µs target, C10 residency medians were 89.27%/90.18%/86.95% on probe CPU 6 and 87.42%/90.59%/87.32% on timerlat CPU 7 across baseline/pressure/recovery. At 800 µs, C10 residency was zero on both CPUs in all conditions.
+- At baseline, the 800 µs arm reduced wake and timerlat P99 values by about 104–108 µs relative to 1,000 µs. The pressure-associated P99 reduction remained large in both arms: 326/316/325/363 µs for wake/IRQ/thread/user-return at 1,000 µs and 218/207/219/253 µs at 800 µs. The QoS-by-pressure interactions were about +101–107 µs, attenuating but not removing the pressure response.
+- The timerlat pressure response occurred while C10 remained near 90% on CPUs 6 and 7 under the 1,000 µs request; it also occurred with C10 at zero under 800 µs. This rules out a simple account in which the pressure effect is only the result of avoiding C10, but it does not isolate the full mechanism.
+- The PHC/MONORAW pressure interaction was +0.0465 ppb, with a descriptive interval from −0.0595 to +0.1184 ppb. The `CLOCK_MONOTONIC`/RAW interaction interval also included zero. Neither same-host comparison establishes actual elapsed-time accuracy.
+
+### Measurement-integrity note
+
+During late-campaign diagnostics, I opened `trace_pipe` shortly after a status poll had shown the timerlat tracer active. This interface can consume buffered trace events, so a transient effect around trial 22 cannot be ruled out. The retained trace contains complete IRQ and thread activation IDs 1–3,000, 2,999 user-return records, and zero buffer loss; no missing or duplicate IDs were found. I kept the raw trial and ran a sensitivity analysis without its QoS-800 pressure record. The four-replicate pressure interactions remained about +101–108 µs across all four latency outcomes, so the main interpretation did not change. Trial 22 remains flagged rather than being described as untouched by diagnostics.
+
+### Next
+
+- Add per-transition CPU idle state entry/exit events to timerlat runs on CPUs 6 and 7, then correlate each event with the immediately preceding state and idle duration.
+- Continue the search for an independently calibrated elapsed-time reference; no hardware clock-rate claim is supported yet.
 
 ## Findings ledger
 
@@ -157,5 +237,9 @@ This journal separates implementation and test results from measurements perform
 | CPU pressure changes aggregate per-CPU C10 residency | `observed cpuidle counters` | Residency fell by about 45.6 percentage points with four pinned CPUs busy and returned during recovery; package state and causality unmeasured |
 | CPU pressure changes timer wake lateness when sampler migration is removed | `sampler-affinity follow-up` | Five CPU 7-pinned pairs reproduced a 339.9 µs P99 reduction with zero migrations; migration is not required, mechanism still unresolved |
 | worker-03 timerlat reports per-CPU IRQ/thread latency | `tracefs diagnostic smoke` | 1,600 paired activations captured with no malformed/incomplete records; strong per-CPU differences require controlled replication |
+| CPU pressure changes timerlat P99 | `controlled timerlat and threshold campaigns` | Five randomized pairs per QoS arm reduced wake/IRQ/thread/user-return P99 by 218–363 µs; large response persists with C10 excluded and is not clock-rate evidence |
+| An 800 µs CPU latency constraint removes measured C10 residency and changes timer latency | `30-trial QoS intervention` | C10 fell to zero on CPUs 6 and 7; baseline P99 improved about 105 µs and the pressure response attenuated about 105 µs, while a large pressure effect remained |
+| Crossing the measured C10 latency threshold changes C10 eligibility and baseline latency | `30-trial 1,000-vs-800 µs threshold follow-up` | 1,000 µs allowed about 87–91% C10 residency on CPUs 6/7; 800 µs removed it. Baseline P99 fell about 104–108 µs, while pressure P99 remained similar across targets; trial 22 is flagged and excluded in sensitivity analysis |
+| CPU pressure causes a physical PHC clock-rate change | `internal cross-stamp fit` | A sub-ppb QoS interaction was estimated, but it is inconsistent with the prior campaign and below modeled capture uncertainty; no verified clock-rate finding |
 | Paired NIC-PHC cross-timestamps provide external elapsed-time authority | `hypothesis` | The ioctl works, but its calibration, shared-clock dependencies and capture uncertainty remain unverified |
 | An autonomous agent compromised a timing evaluator | `hypothesis` | Not studied |

@@ -9,9 +9,11 @@ ClockPressure is an open, Linux-focused experimental research project. It uses l
 - **Clock-rate error:** a reported clock advances at a different rate from a trustworthy external time reference.
 - **Contract / evaluation failure:** a test reports success because its measurement authority differs from the requirement being tested.
 
-**Status:** The executable instrumentation and synthetic timing-contract positive control are implemented. Three randomized worker-03 campaigns are complete. Four-core pressure repeatedly reduced timer-wakeup lateness by about 0.34 ms, including when the sampler was pinned to CPU 7 with zero migrations. Paired PHC cross-stamps showed no resolved pressure-related rate change. No externally validated clock anomaly or natural false pass has been observed.
+**Status:** The executable instrumentation and synthetic timing-contract positive control are implemented. Three initial worker-03 campaigns and three controlled 30-trial timerlat/QoS campaigns are complete. Four-core pressure repeatedly reduced timer-wakeup and timerlat P99 latency by 0.2–0.36 ms. In the direct 1,000-vs-800 µs comparison, the lower target removed measured C10 residency and reduced baseline timer-path P99 by about 0.10 ms; the large pressure response remained under both targets. No externally validated clock anomaly or natural false pass has been observed.
 
 The first-campaign results are in [the initial worker-03 findings](docs/INITIAL_PILOT_FINDINGS.md), the cross-stamp and cpuidle follow-up is in [the second findings report](docs/CSTATE_CROSSSTAMP_FOLLOWUP.md), and sampler-placement results are in [the third findings report](docs/SAMPLER_AFFINITY_FOLLOWUP.md). Raw worker data and regenerated analysis are preserved outside the repository under `/home/epi13/Documents/Projects/.clockpressure-data/worker-03/` and on worker-03 under `/home/worker-03/clockpressure-data/`.
+
+The three controlled timerlat and CPU latency QoS campaigns show a clear latency response and a partial idle-policy contribution, but no independently verified elapsed-time discrepancy. The direct C10-threshold follow-up and its trace-integrity sensitivity check are in the [QoS findings](docs/CPU_LATENCY_QOS_FINDINGS.md#explicit-800-vs-1000-microsecond-threshold-follow-up). See also the [timerlat findings](docs/TIMERLAT_CONTROLLED_FINDINGS.md) and [campaign design](docs/TIMERLAT_CONTROLLED_CAMPAIGN.md).
 
 ## Research question
 
@@ -41,6 +43,8 @@ An agent or program can satisfy what a test *measures* without satisfying what t
 | [Safety and research ethics](docs/SAFETY_AND_ETHICS.md) | Load ceilings, stop conditions, honest claims |
 | [Experimental journal](docs/EXPERIMENT_JOURNAL.md) | Implementation, worker execution and research findings kept separate |
 | [Paired cross-stamp follow-up](docs/CSTATE_CROSSSTAMP_FOLLOWUP.md) | Five-pair worker-03 PHC, timer and cpuidle findings |
+| [Controlled timerlat findings](docs/TIMERLAT_CONTROLLED_FINDINGS.md) | Thirty-trial timerlat and pressure campaign with raw-trace integrity checks |
+| [CPU latency QoS findings](docs/CPU_LATENCY_QOS_FINDINGS.md) | Controlled 800-vs-default and 1,000-vs-800 µs idle-latency interventions, thermal stop, and integrity sensitivity results |
 | [Sampler affinity follow-up](docs/SAMPLER_AFFINITY_FOLLOWUP.md) | Five-pair worker-03 sampler-pinned timer and cpuidle findings |
 | [Timerlat tracer smoke](docs/TIMERLAT_TRACING_SPIKE.md) | Built-in IRQ/thread tracer capability and per-CPU diagnostic |
 | [Contributing](CONTRIBUTING.md) | Contribution and review expectations |
@@ -66,6 +70,7 @@ ClockPressure separates the native timing path, pressure generation, system inst
 - `experiments/run_trial.py` captures the environment, low-rate thermal/frequency/PSI and per-CPU cpuidle residency context, clock-read gaps, raw samples, logs and checksums. It retains interrupted runs.
 - `experiments/run_campaign.py` runs an uninstrumented pressure-free baseline first, then seed-randomizes replicated baseline/CPU-pressure pairs, allows recovery and collects a recovery observation after every pressure run.
 - `analysis/analyze_runs.py` derives latency quantiles, internal and paired cross-timestamp rate comparisons, endpoint read-bracket bounds, environmental summaries, per-CPU C10 residency, CPU migrations and run-paired contrasts from retained raw runs. `analysis/analyze_timerlat.py` summarizes retained Linux timerlat tracer output by CPU and pairs IRQ/thread records with optional userspace-return latency.
+- `experiments/run_timerlat_campaign.py` manages a guarded tracefs timerlat user-read path beside the normal probe, compares enabled and disabled arms, and preserves tracefs restoration evidence. `analysis/analyze_timerlat_campaign.py` reports paired probe and timerlat latency contrasts without treating them as clock-rate measurements.
 
 On worker-03, from a checkout of the recorded revision:
 
