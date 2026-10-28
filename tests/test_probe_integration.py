@@ -56,6 +56,7 @@ class TestProbeIntegration(unittest.TestCase):
         events = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual(events[0]["kind"], "metadata")
         self.assertEqual(events[1]["kind"], "start")
+        self.assertIn("ptp_errno", events[1])
         samples = [event for event in events if event["kind"] == "sample"]
         end = next(event for event in events if event["kind"] == "end")
         self.assertEqual(len(samples), 20)

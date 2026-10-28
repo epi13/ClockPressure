@@ -177,8 +177,14 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
             if end.get(clock) is not None and start.get(clock) is not None
         },
         "internal_rate_comparisons": {
-            clock: _rate_comparison(start, end, clock)
-            for clock in ("monotonic_ns", "boottime_ns", "realtime_ns", "tai_ns", "ptp_ns")
+            label: _rate_comparison(start, end, clock)
+            for label, clock in (
+                ("monotonic_vs_raw", "monotonic_ns"),
+                ("boottime_vs_raw", "boottime_ns"),
+                ("realtime_vs_raw", "realtime_ns"),
+                ("tai_vs_raw", "tai_ns"),
+                ("ptp_vs_raw", "ptp_ns"),
+            )
         },
         "wakeup_lateness_ns": _quantiles(lateness),
         "wakeup_lateness_exploratory_outliers": _robust_outlier_count(lateness),
@@ -212,14 +218,14 @@ def _group_summaries(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for (condition, observer), members in sorted(grouped.items()):
         wake_p99 = [run["wakeup_lateness_ns"].get("p99") for run in members]
         mono_rates = [
-            run["internal_rate_comparisons"]["monotonic_ns"]["difference_ppm_vs_raw"]
+            run["internal_rate_comparisons"]["monotonic_vs_raw"]["difference_ppm_vs_raw"]
             for run in members
-            if run["internal_rate_comparisons"].get("monotonic_ns")
+            if run["internal_rate_comparisons"].get("monotonic_vs_raw")
         ]
         ptp_rates = [
-            run["internal_rate_comparisons"]["ptp_ns"]["difference_ppm_vs_raw"]
+            run["internal_rate_comparisons"]["ptp_vs_raw"]["difference_ppm_vs_raw"]
             for run in members
-            if run["internal_rate_comparisons"].get("ptp_ns")
+            if run["internal_rate_comparisons"].get("ptp_vs_raw")
         ]
         summaries.append(
             {
@@ -313,8 +319,8 @@ def _paired_contrasts(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _markdown(report: dict[str, Any]) -> str:
     rows = []
     for run in report["runs"]:
-        raw = run.get("internal_rate_comparisons", {}).get("monotonic_raw") or {}
-        ptp = run.get("internal_rate_comparisons", {}).get("ptp") or {}
+        raw = run.get("internal_rate_comparisons", {}).get("monotonic_vs_raw") or {}
+        ptp = run.get("internal_rate_comparisons", {}).get("ptp_vs_raw") or {}
         latency = run["wakeup_lateness_ns"]
         sched = run["scheduler_witness"]["runnable_latency_ns"]
         rows.append(

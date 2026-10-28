@@ -44,6 +44,8 @@ typedef struct {
     bool realtime_ok;
     bool tai_ok;
     bool ptp_ok;
+    bool ptp_attempted;
+    int ptp_errno;
     bool tsc_ok;
 } snapshot_t;
 
@@ -193,8 +195,12 @@ snapshot(snapshot_t *s, clockid_t ptp_clock, bool want_tsc)
 #ifdef CLOCK_TAI
     s->tai_ok = read_clock(CLOCK_TAI, &s->tai_ns);
 #endif
-    if (ptp_clock >= 0)
+    if (ptp_clock != (clockid_t)-1) {
+        s->ptp_attempted = true;
         s->ptp_ok = read_clock(ptp_clock, &s->ptp_ns);
+        if (!s->ptp_ok)
+            s->ptp_errno = errno;
+    }
     if (want_tsc)
         s->tsc_ok = read_tsc(&s->tsc, &s->tsc_aux);
     s->cpu_after = sched_getcpu();
@@ -243,6 +249,12 @@ print_snapshot_fields(const snapshot_t *s)
     json_u64("realtime_ns", s->realtime_ok, s->realtime_ns, true);
     json_u64("tai_ns", s->tai_ok, s->tai_ns, true);
     json_u64("ptp_ns", s->ptp_ok, s->ptp_ns, true);
+    printf("\"ptp_errno\":");
+    if (s->ptp_attempted && !s->ptp_ok)
+        printf("%d", s->ptp_errno);
+    else
+        printf("null");
+    putchar(',');
     json_u64("tsc_ticks", s->tsc_ok, s->tsc, true);
     printf("\"tsc_aux\":");
     if (s->tsc_ok)
@@ -498,7 +510,7 @@ run_overhead(const options_t *opts)
         else
             ++tai_fail;
 #endif
-        if (ptp_clock >= 0) {
+        if (ptp_clock != (clockid_t)-1) {
             if (read_clock(ptp_clock, &a) && read_clock(ptp_clock, &b) && b >= a)
                 ptp_gap[ptp_n++] = b - a;
             else

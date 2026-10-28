@@ -2,6 +2,7 @@ import unittest
 
 from analysis.analyze_runs import (
     _bootstrap_mean_interval,
+    _group_summaries,
     _period_errors,
     _quantiles,
     _rate_comparison,
@@ -38,3 +39,20 @@ class TestAnalysis(unittest.TestCase):
         self.assertLessEqual(interval["lower_2_5_percent"], 2)
         self.assertGreaterEqual(interval["upper_97_5_percent"], 2)
         self.assertEqual(interval, _bootstrap_mean_interval([1, 2, 3], 42))
+
+    def test_group_summary_reads_named_internal_rate_comparisons(self):
+        summary = _group_summaries(
+            [
+                {
+                    "condition": "baseline",
+                    "observer": "none",
+                    "wakeup_lateness_ns": {"p99": 500},
+                    "internal_rate_comparisons": {
+                        "monotonic_vs_raw": {"difference_ppm_vs_raw": 4.5},
+                        "ptp_vs_raw": {"difference_ppm_vs_raw": -12.0},
+                    },
+                }
+            ]
+        )
+        self.assertEqual(summary[0]["run_monotonic_minus_raw_ppm"]["median"], 4.5)
+        self.assertEqual(summary[0]["run_ptp_minus_raw_ppm"]["median"], -12.0)
