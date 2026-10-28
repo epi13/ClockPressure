@@ -67,6 +67,8 @@ class TestTimerlatCampaignAnalysis(unittest.TestCase):
                     "cpu": 7,
                     "interval_seconds": 1.0,
                     "output": "turbostat.tsv",
+                    "observer_process_state": {"affinity_cpus": [7]},
+                    "observer_process_state_at_stop": {"affinity_cpus": [7]},
                 },
                 "trials": [
                     {
@@ -109,6 +111,10 @@ class TestTimerlatCampaignAnalysis(unittest.TestCase):
             report["per_trial"][0]["turbostat_cpu_telemetry"]["sample_count"],
             4,
         )
+        self.assertEqual(
+            report["turbostat_capture"]["observer_process_state"]["affinity_cpus"],
+            [7],
+        )
         temp_contrast = next(
             item
             for item in report["paired_contrasts"]
@@ -117,6 +123,7 @@ class TestTimerlatCampaignAnalysis(unittest.TestCase):
         )
         self.assertEqual(temp_contrast["paired_difference"]["median"], 9.5)
         self.assertIn("Turbostat CPU telemetry", _markdown(report))
+        self.assertIn("Sampler process state after the first sample", _markdown(report))
 
     def test_pairs_probe_and_timerlat_metrics_by_arm_and_replicate(self):
         campaign = {
@@ -235,7 +242,7 @@ class TestTimerlatCampaignAnalysis(unittest.TestCase):
 
 
 class TestTracefsHelpers(unittest.TestCase):
-    def test_turbostat_sampler_records_and_applies_isolated_observer_cpu(self):
+    def test_turbostat_sampler_records_observed_process_state_without_relocating(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "turbostat.tsv"
             fake_process = mock.Mock()
@@ -253,7 +260,6 @@ class TestTracefsHelpers(unittest.TestCase):
                 output,
                 cpu=7,
                 interval_sec=0.5,
-                observer_cpu=0,
             )
             with (
                 mock.patch.object(timerlat_runner.shutil, "which", return_value="/usr/bin/turbostat"),
@@ -263,7 +269,7 @@ class TestTracefsHelpers(unittest.TestCase):
                 mock.patch.object(
                     timerlat_runner.os,
                     "sched_getaffinity",
-                    side_effect=[{7}, {0}, {0}],
+                    side_effect=[{7}, {7}],
                 ),
                 mock.patch.object(timerlat_runner.os, "getpriority", return_value=-20),
                 mock.patch.object(
@@ -280,11 +286,9 @@ class TestTracefsHelpers(unittest.TestCase):
                 sampler.start()
                 record = sampler.stop()
 
-        set_affinity.assert_called_once_with(4243, {0})
-        self.assertEqual(record["observer_cpu_requested"], 0)
-        self.assertEqual(record["observer_process_state_before_move"]["affinity_cpus"], [7])
-        self.assertEqual(record["observer_process_state"]["affinity_cpus"], [0])
-        self.assertEqual(record["observer_process_state_at_stop"]["affinity_cpus"], [0])
+        set_affinity.assert_not_called()
+        self.assertEqual(record["observer_process_state"]["affinity_cpus"], [7])
+        self.assertEqual(record["observer_process_state_at_stop"]["affinity_cpus"], [7])
         self.assertEqual(record["observer_process_state"]["nice"], -20)
         self.assertEqual(record["observer_process_state"]["scheduler_policy"], "SCHED_OTHER")
 

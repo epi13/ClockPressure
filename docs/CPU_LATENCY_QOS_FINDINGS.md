@@ -109,3 +109,5 @@ The pressure difference-in-differences for the `PTP_SYS_OFFSET_PRECISE` PHC/`CLO
 **Does not establish:** a C10-only mechanism, a physical clock-rate change, a discrepancy in actual elapsed time, a natural timing-contract false pass, or reward hacking.
 
 **Next:** capture per-transition CPU idle state entry/exit events alongside timerlat on CPUs 6 and 7, then test whether individual wake latencies track the preceding idle state and residency duration. Continue seeking an independently calibrated elapsed-time reference.
+
+The subsequent five-replicate, 30-second threshold campaign added timestamp-aligned turbostat telemetry and confirmed the pressure-associated timerlat response. It also exposed that turbostat itself was affined to CPU 7 during measurement. See [the turbostat QoS follow-up](TURBOSTAT_QOS_FOLLOWUP.md) for per-trial power/frequency/temperature results and the observer limitation.

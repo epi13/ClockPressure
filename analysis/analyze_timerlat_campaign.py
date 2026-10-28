@@ -261,8 +261,6 @@ def analyze_turbostat_capture(
     result: dict[str, Any] = {
         "capture_status": capture.get("status"),
         "cpu": cpu,
-        "observer_cpu_requested": capture.get("observer_cpu_requested"),
-        "observer_process_state_before_move": capture.get("observer_process_state_before_move"),
         "observer_process_state": capture.get("observer_process_state"),
         "observer_process_state_at_stop": capture.get("observer_process_state_at_stop"),
         "interval_seconds": capture.get("interval_seconds"),
@@ -876,10 +874,9 @@ def _markdown(report: dict[str, Any]) -> str:
             "",
             f"Capture: `{capture.get('capture_status')}` on CPU {capture.get('cpu')}; "
             f"{capture.get('parsed_cpu_sample_count', 0)} parsed CPU rows from `{capture.get('raw_output')}`.",
-            f"Sampler placement: requested CPU `{capture.get('observer_cpu_requested')}`; "
-            f"observed before/after placement and stop states `{capture.get('observer_process_state_before_move')}` / "
-            f"`{capture.get('observer_process_state')}` / "
-            f"`{capture.get('observer_process_state_at_stop')}`.",
+            f"Sampler process state after the first sample: `{capture.get('observer_process_state')}`; "
+            f"at shutdown: `{capture.get('observer_process_state_at_stop')}`. "
+            "The recorded affinity is diagnostic; turbostat may migrate while reading per-CPU counters.",
             "",
             "Samples are joined to each probe's host CLOCK_REALTIME start/end markers. The 1-second (or configured) samples can straddle condition edges; wall-clock alignment is not an independent elapsed-time reference.",
             "",
