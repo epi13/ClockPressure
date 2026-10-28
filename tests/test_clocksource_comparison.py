@@ -71,7 +71,23 @@ class TestClocksourceComparisonAnalysis(unittest.TestCase):
                     ("tsc", -200.0 - pair, -150.0 - pair),
                     ("acpi_pm", -100.0 - pair, -120.0 - pair),
                 ):
-                    report_path = root / f"pair-{pair}-{source}.json"
+                    campaign_dir = root / f"pair-{pair}-{source}"
+                    probe_dir = campaign_dir / "runs" / "timerlat_user" / "trial-01"
+                    probe_dir.mkdir(parents=True)
+                    precise = source == "tsc"
+                    (probe_dir / "probe.jsonl").write_text(
+                        json.dumps(
+                            {
+                                "kind": "metadata",
+                                "ptp_open": True,
+                                "ptp_precise_crossstamp_available": precise,
+                                "ptp_precise_probe_errno": None if precise else 19,
+                            }
+                        )
+                        + "\n"
+                    )
+                    (campaign_dir / "campaign.json").write_text("{}\n")
+                    report_path = campaign_dir / "timerlat-campaign-analysis.json"
                     report_path.write_text(
                         json.dumps(
                             {
@@ -100,7 +116,8 @@ class TestClocksourceComparisonAnalysis(unittest.TestCase):
                             "clocksource": source,
                             "status": "complete",
                             "campaign_status": "complete",
-                            "analysis_path": report_path.name,
+                            "analysis_path": f"pair-{pair}-{source}/{report_path.name}",
+                            "campaign_path": f"pair-{pair}-{source}/campaign.json",
                         }
                     )
             manifest_path = root / "comparison.json"
@@ -121,6 +138,24 @@ class TestClocksourceComparisonAnalysis(unittest.TestCase):
         self.assertFalse(report["clockrate_claim_allowed"])
         self.assertIn("not an independent reference", " ".join(report["interpretation_limits"]))
         self.assertIn("intervention-minus-control", rendered)
+        tsc = next(
+            item for item in report["ptp_capability_by_clocksource"] if item["clocksource"] == "tsc"
+        )
+        acpi_pm = next(
+            item for item in report["ptp_capability_by_clocksource"] if item["clocksource"] == "acpi_pm"
+        )
+        self.assertEqual(tsc["metadata_record_count"], 3)
+        self.assertEqual(tsc["ptp_open"], {"True": 3})
+        self.assertEqual(tsc["precise_crossstamp_available"], {"True": 3})
+        self.assertEqual(acpi_pm["precise_crossstamp_available"], {"False": 3})
+        self.assertEqual(acpi_pm["precise_probe_errno_counts"], {"19": 3})
+        tsc_wake = next(
+            item
+            for item in report["per_clocksource_pressure_effects"]
+            if item["clocksource"] == "tsc" and item["metric"] == "clockpressure_wakeup_p99"
+        )
+        self.assertEqual(tsc_wake["pressure_minus_baseline"]["median"], -202.0)
+        self.assertIn("PTP precise crossstamp availability", rendered)
 
 
 if __name__ == "__main__":

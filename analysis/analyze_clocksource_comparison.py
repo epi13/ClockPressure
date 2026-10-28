@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,43 @@ def _resolve(root: Path, relative: str) -> Path:
     return path if path.is_absolute() else root / path
 
 
+def _ptp_capability(campaign_dir: Path) -> dict[str, Any]:
+    """Count PTP open and precise-crossstamp results from native probe metadata."""
+    probe_files = 0
+    metadata_records = 0
+    open_counts: Counter[str] = Counter()
+    precise_counts: Counter[str] = Counter()
+    errno_counts: Counter[str] = Counter()
+    for path in sorted(campaign_dir.rglob("probe.jsonl")):
+        probe_files += 1
+        with path.open(encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"{path}:{line_number}: invalid JSON: {exc}") from exc
+                if record.get("kind") != "metadata":
+                    continue
+                metadata_records += 1
+                open_counts[str(record.get("ptp_open", "missing"))] += 1
+                precise_counts[
+                    str(record.get("ptp_precise_crossstamp_available", "missing"))
+                ] += 1
+                if record.get("ptp_precise_probe_errno") is not None:
+                    errno_counts[str(record["ptp_precise_probe_errno"])] += 1
+    return {
+        "probe_file_count": probe_files,
+        "metadata_record_count": metadata_records,
+        "ptp_open": dict(sorted(open_counts.items())),
+        "precise_crossstamp_available": dict(sorted(precise_counts.items())),
+        "precise_probe_errno_counts": dict(
+            sorted(errno_counts.items(), key=lambda item: int(item[0]))
+        ),
+    }
+
+
 def analyze_comparison(manifest_path: Path) -> dict[str, Any]:
     manifest_path = manifest_path.resolve()
     root = manifest_path.parent
@@ -36,12 +74,32 @@ def analyze_comparison(manifest_path: Path) -> dict[str, Any]:
     design = manifest.get("design", {})
     seed = int(design.get("seed", 0))
     by_pair: dict[int, dict[str, dict[str, float]]] = {}
+    by_source: dict[str, dict[str, list[float]]] = {}
+    ptp_by_source: dict[str, dict[str, Any]] = {}
     run_summaries: list[dict[str, Any]] = []
     for run in manifest.get("runs", []):
         analysis_path = _resolve(root, str(run.get("analysis_path", "")))
+        campaign_path = _resolve(root, str(run.get("campaign_path", "")))
+        campaign_dir = campaign_path.parent if campaign_path.is_file() else analysis_path.parent
+        source = str(run.get("clocksource", "unknown"))
+        ptp = _ptp_capability(campaign_dir)
+        source_ptp = ptp_by_source.setdefault(
+            source,
+            {
+                "probe_file_count": 0,
+                "metadata_record_count": 0,
+                "ptp_open": Counter(),
+                "precise_crossstamp_available": Counter(),
+                "precise_probe_errno_counts": Counter(),
+            },
+        )
+        source_ptp["probe_file_count"] += ptp["probe_file_count"]
+        source_ptp["metadata_record_count"] += ptp["metadata_record_count"]
+        for key in ("ptp_open", "precise_crossstamp_available", "precise_probe_errno_counts"):
+            source_ptp[key].update(ptp[key])
         summary: dict[str, Any] = {
             "pair": run.get("pair"),
-            "clocksource": run.get("clocksource"),
+            "clocksource": source,
             "status": run.get("status"),
             "campaign_status": run.get("campaign_status"),
             "analysis_path": str(analysis_path.relative_to(root))
@@ -49,6 +107,7 @@ def analyze_comparison(manifest_path: Path) -> dict[str, Any]:
             else str(analysis_path),
             "analysis_sha256": run.get("analysis_sha256"),
             "pressure_contrasts": {},
+            "ptp_capability": ptp,
         }
         if not analysis_path.is_file():
             summary["analysis_error"] = "analysis report is missing"
@@ -71,8 +130,8 @@ def analyze_comparison(manifest_path: Path) -> dict[str, Any]:
             if isinstance(value, (int, float)):
                 summary["pressure_contrasts"][metric] = float(value)
                 pair = int(run["pair"])
-                source = str(run["clocksource"])
                 by_pair.setdefault(pair, {}).setdefault(source, {})[metric] = float(value)
+                by_source.setdefault(source, {}).setdefault(metric, []).append(float(value))
         summary["timerlat_integrity"] = report.get("timerlat_integrity")
         run_summaries.append(summary)
 
@@ -120,6 +179,41 @@ def analyze_comparison(manifest_path: Path) -> dict[str, Any]:
             }
         )
 
+    source_pressure_summaries = []
+    for source in sources:
+        for metric, unit in _FOCUS_METRICS.items():
+            values = by_source.get(source, {}).get(metric, [])
+            source_pressure_summaries.append(
+                {
+                    "clocksource": source,
+                    "metric": metric,
+                    "unit": unit,
+                    "pressure_effect_n": len(values),
+                    "pressure_minus_baseline": _quantiles(values),
+                }
+            )
+
+    ptp_capability_by_clocksource = []
+    for source in sources:
+        counts = ptp_by_source.get(source, {})
+        ptp_capability_by_clocksource.append(
+            {
+                "clocksource": source,
+                "probe_file_count": counts.get("probe_file_count", 0),
+                "metadata_record_count": counts.get("metadata_record_count", 0),
+                "ptp_open": dict(sorted(counts.get("ptp_open", {}).items())),
+                "precise_crossstamp_available": dict(
+                    sorted(counts.get("precise_crossstamp_available", {}).items())
+                ),
+                "precise_probe_errno_counts": dict(
+                    sorted(
+                        counts.get("precise_probe_errno_counts", {}).items(),
+                        key=lambda item: int(item[0]),
+                    )
+                ),
+            }
+        )
+
     complete_pair_count = len(
         {
             pair
@@ -138,12 +232,15 @@ def analyze_comparison(manifest_path: Path) -> dict[str, Any]:
         "external_elapsed_time_reference": None,
         "complete_source_pair_count": complete_pair_count,
         "per_run": run_summaries,
+        "per_clocksource_pressure_effects": source_pressure_summaries,
+        "ptp_capability_by_clocksource": ptp_capability_by_clocksource,
         "paired_pressure_contrasts": pair_contrasts,
         "paired_summary": paired_summaries,
         "interpretation_limits": [
             "Clocksource comparisons change Linux system timekeeping, not an independent reference.",
             "CLOCK_MONOTONIC, CLOCK_MONOTONIC_RAW and timerlat trace timestamps are not independent of the selected kernel timekeeping source.",
             "The PHC cross-stamp is a same-host comparison with unverified calibration and capture uncertainty.",
+            "PTP_SYS_OFFSET_PRECISE availability is a capability result; losing this ioctl under a selected source does not show that the PHC or clocksource rate changed.",
             "Intervals resample randomized source-pair summaries and do not include serial correlation or source-switch calibration uncertainty.",
             "Timer and clock-interface changes cannot establish actual elapsed-time error without an independent calibrated reference.",
         ],
@@ -183,6 +280,26 @@ def markdown(report: dict[str, Any]) -> str:
         f"{item['intervention_minus_control']:.6g} | {item['unit']} |"
         for item in report["paired_pressure_contrasts"]
     ]
+    source_pressure_rows = []
+    for item in report["per_clocksource_pressure_effects"]:
+        values = item["pressure_minus_baseline"]
+        median = "—" if item["pressure_effect_n"] == 0 else f"{values['median']:.6g}"
+        source_pressure_rows.append(
+            f"| {item['clocksource']} | {item['metric']} | {item['pressure_effect_n']} | "
+            f"{median} | {item['unit']} |"
+        )
+    ptp_rows = []
+    for item in report["ptp_capability_by_clocksource"]:
+        opened = item["ptp_open"].get("True", 0)
+        precise = item["precise_crossstamp_available"].get("True", 0)
+        precise_failed = item["precise_crossstamp_available"].get("False", 0)
+        errno_counts = ", ".join(
+            f"{code}: {count}" for code, count in item["precise_probe_errno_counts"].items()
+        ) or "—"
+        ptp_rows.append(
+            f"| {item['clocksource']} | {item['metadata_record_count']} | {opened} | "
+            f"{precise} | {precise_failed} | {errno_counts} |"
+        )
     return "\n".join(
         [
             "# Linux clocksource comparison analysis",
@@ -197,6 +314,22 @@ def markdown(report: dict[str, Any]) -> str:
             "| Metric | Source pairs | Median intervention-minus-control | Descriptive 95% mean interval | Unit |",
             "| --- | ---: | ---: | ---: | --- |",
             *summary_rows,
+            "",
+            "## Pressure effects by selected source",
+            "",
+            "These are within-source timerlat-enabled pressure-minus-baseline contrasts. They describe timer delivery/latency and are not rate estimates.",
+            "",
+            "| Clocksource | Metric | Runs | Median pressure effect | Unit |",
+            "| --- | --- | ---: | ---: | --- |",
+            *source_pressure_rows,
+            "",
+            "## PTP precise crossstamp availability",
+            "",
+            "The probe opens `/dev/ptp0`, then attempts `PTP_SYS_OFFSET_PRECISE`. This table reports interface capability, not measurement accuracy.",
+            "",
+            "| Clocksource | Metadata samples | PTP opens | Precise success | Precise failure | Errno counts |",
+            "| --- | ---: | ---: | ---: | ---: | --- |",
+            *ptp_rows,
             "",
             "## Per-pair pressure contrasts",
             "",

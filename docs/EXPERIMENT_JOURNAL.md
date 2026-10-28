@@ -263,7 +263,28 @@ During late-campaign diagnostics, I opened `trace_pipe` shortly after a status p
 - The Linux v6.17 turbostat source migrates to the sampled CPU for local counter reads ([source](https://github.com/torvalds/linux/blob/v6.17/tools/power/x86/turbostat/turbostat.c)). The brief move did not isolate the observer. We removed the relocation option and changed instrumentation metadata to record affinity snapshots only. The test that had passed used a mocked process and did not model turbostat's own migration; that was a test-model gap.
 - These smokes do not measure latency, clock rate, observer effect, or elapsed time. The raw JSON and TSV hashes are listed in [the turbostat follow-up](TURBOSTAT_QOS_FOLLOWUP.md). Follow-up work should characterize another telemetry interface's CPU attribution and overhead before using it to claim a separated observer.
 - Read-only inspection after the smoke found `current_clocksource=tsc`, with `acpi_pm` also available, and per-CPU cpuidle `state0` through `state8` files on CPU 7. These are candidate interfaces for a source-dependence comparison and lower-overhead idle telemetry; neither observation establishes independent time or the behavior of a future experiment.
-- Added a reversible, randomized TSC/ACPI PM comparison runner with per-source campaign and restoration records plus a pair-level analyzer. It has not yet run on worker-03; the planned pilot and command are documented in [the clocksource pilot protocol](ACPI_PM_CLOCKSOURCE_PILOT.md).
+- Added a reversible TSC/ACPI PM comparison runner with per-source campaign and restoration records plus a pair-level analyzer. The executed protocol and current results are in [the clocksource pilot protocol](ACPI_PM_CLOCKSOURCE_PILOT.md) and [findings report](ACPI_PM_CLOCKSOURCE_FINDINGS.md).
+
+## 2026-10-28 — TSC and ACPI PM clocksource pilot
+
+### Implemented and executed
+
+- Added an analysis summary for within-source pressure effects and per-trial `PTP_SYS_OFFSET_PRECISE` capability. It counts metadata from raw probe files so missing or unavailable cross-stamps are visible rather than silently omitted from the numeric fit.
+- Ran comparison `20261028T081208Z-clocksource-df8833f7`: three paired blocks with randomized source ordering, six nested campaigns, timerlat disabled/enabled arms, baseline/four-core pressure/recovery observations, 10 seconds per observation, probe CPU 6, timerlat CPU 7 and load CPUs 1–4.
+- Reanalyzed all six nested campaigns from the local archive. All 18 trace digests matched, 18,000 IRQ/thread activations paired, and there were zero incomplete/duplicate/malformed records or trace-buffer loss. The wrapper restored `current_clocksource=tsc`; afterward tracefs reported `nop` and `tracing_on=1`, and no experiment process remained.
+- The 42 MB raw archive is preserved on worker-03 and locally at `.clockpressure-data/worker-03/clocksource-tsc-acpi-pilot-20261028/`. The outer `comparison.json` SHA-256 is `1af5d94343a388d96c01c431fd536f1364e9c9645ca935632540ff1174a46083`.
+
+### Observed
+
+- `/dev/ptp0` opened in 36/36 trials. `PTP_SYS_OFFSET_PRECISE` succeeded in all 18 TSC samples and failed with `ENODEV` in all 18 ACPI PM samples. This is a clocksource-dependent availability result for the e1000e PHC's precise ART cross-stamp; it is not a clock-rate or elapsed-time result.
+- The source-specific median timerlat-enabled pressure reductions remained similar in magnitude: wake P99 fell 332.847 µs under TSC and 339.037 µs under ACPI PM; IRQ P99 fell 323.994 and 301.516 µs. The three-pair source-effect intervals include zero. MONOTONIC-vs-RAW pressure contrast also includes zero, and the precise PHC rate contrast is unavailable for ACPI PM.
+- Upstream Linux v6.17 source explains the observed `ENODEV` path: e1000e labels the simultaneous system counter as ART; timekeeping returns `-ENODEV` when it cannot convert that counter to the selected source. TSC registers ART as a base when available; ACPI PM does not. The worker's Fedora kernel package is 6.17.1 and its exact source patch set was not inspected, so this is a source-backed mechanism explanation, not a binary-level trace.
+
+### Interpretation and next work
+
+- **Supports:** explicitly selecting a system clocksource can alter availability of a hardware-assisted measurement witness. Record witness capability alongside every result.
+- **Does not support:** a system clock error, physical elapsed-time discrepancy, natural timing-contract false pass, or any agent manipulation. The intervention explicitly switched the global clocksource.
+- **Next:** inspect the exact Fedora kernel source package; characterize sequential/extended PTP capture under both sources; assess an independently calibrated PPS or separately characterized timing host. Keep the clocksource and workload interventions separate.
 
 ## Findings ledger
 
@@ -283,4 +304,5 @@ During late-campaign diagnostics, I opened `trace_pipe` shortly after a status p
 | Crossing the measured C10 latency threshold changes C10 eligibility and baseline latency | `30-trial 1,000-vs-800 µs threshold follow-up` | 1,000 µs allowed about 87–91% C10 residency on CPUs 6/7; 800 µs removed it. Baseline P99 fell about 104–108 µs, while pressure P99 remained similar across targets; trial 22 is flagged and excluded in sensitivity analysis |
 | CPU pressure causes a physical PHC clock-rate change | `internal cross-stamp fit` | A sub-ppb QoS interaction was estimated, but it is inconsistent with the prior campaign and below modeled capture uncertainty; no verified clock-rate finding |
 | Paired NIC-PHC cross-timestamps provide external elapsed-time authority | `hypothesis` | The ioctl works, but its calibration, shared-clock dependencies and capture uncertainty remain unverified |
+| Selecting ACPI PM removes e1000e precise-crossstamp availability on worker-03 | `three-pair source-selection pilot` | PTP device open succeeded 36/36; precise crossstamp succeeded 18/18 TSC trials and failed 18/18 ACPI PM trials with `ENODEV`. Upstream v6.17 offers a matching ART-base conversion explanation; exact Fedora source build not inspected. |
 | An autonomous agent compromised a timing evaluator | `hypothesis` | Not studied |

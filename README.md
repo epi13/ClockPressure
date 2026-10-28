@@ -9,11 +9,13 @@ ClockPressure is an open, Linux-focused experimental research project. It uses l
 - **Clock-rate error:** a reported clock advances at a different rate from a trustworthy external time reference.
 - **Contract / evaluation failure:** a test reports success because its measurement authority differs from the requirement being tested.
 
-**Status:** The executable instrumentation and synthetic timing-contract positive control are implemented. Three initial worker-03 campaigns and three controlled 30-trial timerlat/QoS campaigns are complete. Four-core pressure repeatedly reduced timer-wakeup and timerlat P99 latency by 0.2–0.36 ms. In the direct 1,000-vs-800 µs comparison, the lower target removed measured C10 residency and reduced baseline timer-path P99 by about 0.10 ms; the large pressure response remained under both targets. No externally validated clock anomaly or natural false pass has been observed.
+**Status:** The executable instrumentation and synthetic timing-contract positive control are implemented. Three initial worker-03 campaigns and four controlled timerlat/QoS campaigns are complete. Four-core pressure repeatedly reduced timer-wakeup and timerlat P99 latency by 0.2–0.36 ms. In the direct 1,000-vs-800 µs comparison, the lower target removed measured C10 residency and reduced baseline timer-path P99 by about 0.10 ms; the large pressure response remained under both targets. A three-pair TSC/ACPI PM pilot found that `PTP_SYS_OFFSET_PRECISE` worked in all 18 TSC samples but returned `ENODEV` in all 18 ACPI PM samples, exposing a clocksource-dependent measurement capability. No externally validated clock anomaly or natural false pass has been observed.
 
 The first-campaign results are in [the initial worker-03 findings](docs/INITIAL_PILOT_FINDINGS.md), the cross-stamp and cpuidle follow-up is in [the second findings report](docs/CSTATE_CROSSSTAMP_FOLLOWUP.md), and sampler-placement results are in [the third findings report](docs/SAMPLER_AFFINITY_FOLLOWUP.md). Raw worker data and regenerated analysis are preserved outside the repository under `/home/epi13/Documents/Projects/.clockpressure-data/worker-03/` and on worker-03 under `/home/worker-03/clockpressure-data/`.
 
 The three controlled timerlat and CPU latency QoS campaigns show a clear latency response and a partial idle-policy contribution, but no independently verified elapsed-time discrepancy. The direct C10-threshold follow-up and its trace-integrity sensitivity check are in the [QoS findings](docs/CPU_LATENCY_QOS_FINDINGS.md#explicit-800-vs-1000-microsecond-threshold-follow-up). See also the [timerlat findings](docs/TIMERLAT_CONTROLLED_FINDINGS.md) and [campaign design](docs/TIMERLAT_CONTROLLED_CAMPAIGN.md).
+
+The TSC/ACPI PM pilot did not resolve a source-dependent timerlat effect. It did reveal that the selected clocksource changes whether the kernel can convert the e1000e PHC's ART cross-timestamp into system time. Details, source-level explanation, and raw evidence are in the [clocksource pilot findings](docs/ACPI_PM_CLOCKSOURCE_FINDINGS.md).
 
 ## Research question
 
@@ -47,6 +49,7 @@ An agent or program can satisfy what a test *measures* without satisfying what t
 | [CPU latency QoS findings](docs/CPU_LATENCY_QOS_FINDINGS.md) | Controlled 800-vs-default and 1,000-vs-800 µs idle-latency interventions, thermal stop, and integrity sensitivity results |
 | [Turbostat QoS follow-up](docs/TURBOSTAT_QOS_FOLLOWUP.md) | Five-replicate 30-second threshold comparison with aligned per-trial CPU/package telemetry and observer-effect caveats |
 | [TSC and ACPI PM pilot](docs/ACPI_PM_CLOCKSOURCE_PILOT.md) | Reversible, randomized clocksource pressure comparison with per-subcampaign restoration metadata |
+| [TSC and ACPI PM findings](docs/ACPI_PM_CLOCKSOURCE_FINDINGS.md) | Three-pair timerlat comparison and verified source-dependent PHC cross-stamp availability |
 | [Sampler affinity follow-up](docs/SAMPLER_AFFINITY_FOLLOWUP.md) | Five-pair worker-03 sampler-pinned timer and cpuidle findings |
 | [Timerlat tracer smoke](docs/TIMERLAT_TRACING_SPIKE.md) | Built-in IRQ/thread tracer capability and per-CPU diagnostic |
 | [Contributing](CONTRIBUTING.md) | Contribution and review expectations |
