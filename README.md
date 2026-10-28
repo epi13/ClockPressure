@@ -13,7 +13,7 @@ ClockPressure is an open, Linux-focused experimental research project. It uses l
 
 The first-campaign results are in [the initial worker-03 findings](docs/INITIAL_PILOT_FINDINGS.md), the cross-stamp and cpuidle follow-up is in [the second findings report](docs/CSTATE_CROSSSTAMP_FOLLOWUP.md), and sampler-placement results are in [the third findings report](docs/SAMPLER_AFFINITY_FOLLOWUP.md). Raw worker data and regenerated analysis are preserved outside the repository under `/home/epi13/Documents/Projects/.clockpressure-data/worker-03/` and on worker-03 under `/home/worker-03/clockpressure-data/`.
 
-The next controlled comparison separates timerlat IRQ/thread/user-return latency from ClockPressure's end-to-end wake lateness, with timerlat enabled and disabled in randomized baseline/pressure/recovery arms. See [the controlled timerlat campaign design](docs/TIMERLAT_CONTROLLED_CAMPAIGN.md); measurements are pending.
+The controlled timerlat campaign is complete: pressure reduced IRQ, thread, user-return and end-to-end wake-lateness P99s, while internal PHC/MONORAW comparisons still resolved no clock-rate effect. The trace integrity checks passed. See [the campaign findings](docs/TIMERLAT_CONTROLLED_FINDINGS.md) and [the controlled campaign design](docs/TIMERLAT_CONTROLLED_CAMPAIGN.md). A follow-up will constrain CPU idle-exit latency with a temporary, verified PM QoS request.
 
 ## Research question
 
@@ -43,6 +43,7 @@ An agent or program can satisfy what a test *measures* without satisfying what t
 | [Safety and research ethics](docs/SAFETY_AND_ETHICS.md) | Load ceilings, stop conditions, honest claims |
 | [Experimental journal](docs/EXPERIMENT_JOURNAL.md) | Implementation, worker execution and research findings kept separate |
 | [Paired cross-stamp follow-up](docs/CSTATE_CROSSSTAMP_FOLLOWUP.md) | Five-pair worker-03 PHC, timer and cpuidle findings |
+| [Controlled timerlat findings](docs/TIMERLAT_CONTROLLED_FINDINGS.md) | Thirty-trial timerlat and pressure campaign with raw-trace integrity checks |
 | [Sampler affinity follow-up](docs/SAMPLER_AFFINITY_FOLLOWUP.md) | Five-pair worker-03 sampler-pinned timer and cpuidle findings |
 | [Timerlat tracer smoke](docs/TIMERLAT_TRACING_SPIKE.md) | Built-in IRQ/thread tracer capability and per-CPU diagnostic |
 | [Contributing](CONTRIBUTING.md) | Contribution and review expectations |

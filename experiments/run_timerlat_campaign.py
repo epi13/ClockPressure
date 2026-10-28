@@ -9,6 +9,7 @@ import os
 import random
 import re
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -45,6 +46,13 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _relative_artifact(path: Path, root: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return str(path)
 
 
 def _empty_trace(trace: str) -> bool:
@@ -84,6 +92,7 @@ class TracefsTimerlat:
             "enabled_events": _read(self.tracefs / "set_event"),
             "trace_empty": _empty_trace((self.tracefs / "trace").read_text(errors="replace")),
         }
+
 
     def _check_idle_state(self) -> None:
         settings = self.before
@@ -188,6 +197,75 @@ class TracefsTimerlat:
             "cpu_buffer_stats": cpu_stats,
             "trace": trace,
         }
+
+
+class CpuDmaLatencyRequest:
+    """Hold one temporary global CPU latency QoS request on its own FD."""
+
+    def __init__(self, device: Path, requested_us: int):
+        self.device = device
+        self.requested_us = requested_us
+        self.fd: int | None = None
+        if not device.is_char_device():
+            raise RuntimeError(f"CPU latency QoS device is unavailable: {device}")
+        self.effective_before_us = self._read_effective()
+        self.effective_during_us: int | None = None
+
+    def _read_effective(self) -> int:
+        fd = os.open(self.device, os.O_RDONLY)
+        try:
+            value = os.read(fd, 4)
+        finally:
+            os.close(fd)
+        if len(value) != 4:
+            raise RuntimeError(f"short read of effective CPU latency from {self.device}")
+        return struct.unpack("=i", value)[0]
+
+    def start(self) -> None:
+        if self.effective_before_us <= self.requested_us:
+            raise RuntimeError(
+                "existing CPU latency QoS is already at least as restrictive as the requested intervention "
+                f"({self.effective_before_us} us <= {self.requested_us} us)"
+            )
+        self.fd = os.open(self.device, os.O_RDWR)
+        try:
+            written = os.write(self.fd, struct.pack("=i", self.requested_us))
+            if written != 4:
+                raise RuntimeError(f"short write to {self.device}: {written} bytes")
+            self.effective_during_us = self._read_effective()
+            if self.effective_during_us != self.requested_us:
+                raise RuntimeError(
+                    "the requested CPU latency QoS did not become effective: "
+                    f"requested {self.requested_us} us, observed {self.effective_during_us} us"
+                )
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> dict[str, Any]:
+        if self.fd is None:
+            effective_after = self._read_effective()
+            return {
+                "device": str(self.device),
+                "requested_us": self.requested_us,
+                "effective_before_us": self.effective_before_us,
+                "effective_during_us": self.effective_during_us,
+                "effective_after_us": effective_after,
+                "restored": effective_after == self.effective_before_us,
+            }
+        fd, self.fd = self.fd, None
+        os.close(fd)
+        effective_after = self._read_effective()
+        restored = effective_after == self.effective_before_us
+        state = {
+            "device": str(self.device),
+            "requested_us": self.requested_us,
+            "effective_before_us": self.effective_before_us,
+            "effective_during_us": self.effective_during_us,
+            "effective_after_us": effective_after,
+            "restored": restored,
+        }
+        return state
 
 
 def _parse_cpus_arg(value: str) -> list[int]:
@@ -316,6 +394,9 @@ def _run_trial(
         replicate=replicate,
     )
     trace_session = None
+    timerlat_enabled = arm.startswith("timerlat_user")
+    qos_request = None
+    qos_record: dict[str, Any] | None = None
     trial_process: subprocess.Popen[bytes] | None = None
     user_process: subprocess.Popen[bytes] | None = None
     user_stdout = b""
@@ -326,11 +407,17 @@ def _run_trial(
     trace_record: dict[str, Any] | None = None
     error: str | None = None
 
-    if arm == "timerlat_user":
+    if timerlat_enabled:
         trace_session = TracefsTimerlat(
             Path(args.tracefs_root), args.timerlat_cpu, args.period_us, args.buffer_kb
         )
+    if arm == "timerlat_user_pm_qos":
+        qos_request = CpuDmaLatencyRequest(
+            Path(args.cpu_dma_latency_path), args.dma_latency_us
+        )
     try:
+        if qos_request is not None:
+            qos_request.start()
         if trace_session is not None:
             trace_session.start()
         with stdout_path.open("wb") as stdout_stream, stderr_path.open("wb") as stderr_stream:
@@ -342,7 +429,7 @@ def _run_trial(
                 start_new_session=True,
             )
         in_progress = _wait_for_metadata(run_root, known_paths, trial_process)
-        if arm == "timerlat_user":
+        if timerlat_enabled:
             requested_reads = (args.duration_sec * 1_000_000 + args.period_us - 1) // args.period_us
             timerlat_fd = (
                 Path(args.tracefs_root)
@@ -394,6 +481,11 @@ def _run_trial(
                 trace_record = trace_session.stop_and_restore()
             except Exception as exc:
                 error = error or f"tracefs restore: {type(exc).__name__}: {exc}"
+        if qos_request is not None:
+            try:
+                qos_record = qos_request.close()
+            except Exception as exc:
+                error = error or f"CPU latency QoS restore: {type(exc).__name__}: {exc}"
 
     run_dir = None
     stdout_text = stdout_path.read_text(errors="replace") if stdout_path.exists() else ""
@@ -414,12 +506,12 @@ def _run_trial(
         "role": role,
         "command": command,
         "trial_returncode": trial_returncode,
-        "run_dir": str(run_dir) if run_dir else None,
-        "trial_stdout": str(stdout_path),
-        "trial_stderr": str(stderr_path),
+        "run_dir": _relative_artifact(run_dir, out) if run_dir else None,
+        "trial_stdout": _relative_artifact(stdout_path, out),
+        "trial_stderr": _relative_artifact(stderr_path, out),
         "status": "complete" if error is None and trial_returncode == 0 else "failed",
     }
-    if arm == "timerlat_user":
+    if timerlat_enabled:
         worker_summary: dict[str, Any] | None = None
         try:
             worker_summary = json.loads(user_stdout.decode(errors="replace").strip())
@@ -443,9 +535,9 @@ def _run_trial(
             analysis = analyze_trace(trace_path)
             analysis_path = timerlat_dir / f"{run_id}.analysis.json"
             _write_json(analysis_path, analysis)
-            entry["timerlat_trace"] = str(trace_path)
+            entry["timerlat_trace"] = _relative_artifact(trace_path, out)
             entry["timerlat_trace_sha256"] = _sha256(trace_path)
-            entry["timerlat_analysis"] = str(analysis_path)
+            entry["timerlat_analysis"] = _relative_artifact(analysis_path, out)
             entry["timerlat_analysis_summary"] = analysis["latency_ns"]
             entry["timerlat_activation_integrity"] = {
                 "matched_irq_thread_activations": analysis["matched_irq_thread_activation_count"],
@@ -462,12 +554,17 @@ def _run_trial(
             if not trace_record.get("restored"):
                 entry["error"] = "tracefs settings were not restored to their prior state"
                 entry["status"] = "failed"
+    if qos_record is not None:
+        entry["cpu_dma_latency_request"] = qos_record
+        if not qos_record.get("restored"):
+            entry["error"] = "CPU latency QoS did not return to its prior effective value"
+            entry["status"] = "failed"
     if error:
         entry["error"] = error
         entry["status"] = "failed"
     if trial_returncode not in (0, None):
         entry["error"] = entry.get("error") or f"ClockPressure trial exited {trial_returncode}"
-    if arm == "timerlat_user" and user_returncode not in (0, None):
+    if timerlat_enabled and user_returncode not in (0, None):
         entry["error"] = entry.get("error") or f"timerlat user worker exited {user_returncode}"
         entry["status"] = "failed"
     return entry
@@ -475,6 +572,12 @@ def _run_trial(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--design",
+        choices=("observer", "cpu_latency_qos"),
+        default="observer",
+        help="compare tracer off/on, or timerlat with default/PM QoS idle-latency policy",
+    )
     parser.add_argument("--duration-sec", type=int, default=30)
     parser.add_argument("--period-us", type=int, default=10000)
     parser.add_argument("--repeats", type=int, default=5)
@@ -489,6 +592,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int)
     parser.add_argument("--host-alias", default="worker-03")
     parser.add_argument("--tracefs-root", default="/sys/kernel/tracing")
+    parser.add_argument("--cpu-dma-latency-path", default="/dev/cpu_dma_latency")
+    parser.add_argument("--dma-latency-us", type=int, default=0)
     parser.add_argument("--data-dir", default="~/clockpressure-data/timerlat-controlled")
     return parser
 
@@ -514,6 +619,8 @@ def run_campaign(args: argparse.Namespace) -> Path:
         raise ValueError("--warmup-sec must be in 0..30")
     if not 1 <= args.fifo_priority <= 99:
         raise ValueError("--fifo-priority must be in 1..99")
+    if not 0 <= args.dma_latency_us <= 2_000_000_000:
+        raise ValueError("--dma-latency-us must be in 0..2000000000")
 
     online_cpus = os.sched_getaffinity(0)
     requested_cpus = set(args.load_cpus) | {args.probe_cpu, args.timerlat_cpu}
@@ -523,6 +630,18 @@ def run_campaign(args: argparse.Namespace) -> Path:
         raise RuntimeError("ClockPressure trial or timerlat user worker is missing")
     if not (ROOT / "build" / "clockpressure-probe").is_file():
         raise RuntimeError("native probe is missing; run `make all` first")
+
+    qos_initial_effective_us = None
+    if args.design == "cpu_latency_qos":
+        qos_preflight = CpuDmaLatencyRequest(
+            Path(args.cpu_dma_latency_path), args.dma_latency_us
+        )
+        qos_initial_effective_us = qos_preflight.effective_before_us
+        if qos_initial_effective_us <= args.dma_latency_us:
+            raise RuntimeError(
+                "CPU latency QoS intervention would not change the effective setting: "
+                f"current={qos_initial_effective_us} us, requested={args.dma_latency_us} us"
+            )
 
     out = Path(args.data_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -535,6 +654,21 @@ def run_campaign(args: argparse.Namespace) -> Path:
     seed = args.seed if args.seed is not None else random.SystemRandom().randrange(1 << 63)
     randomizer = random.Random(seed)
     campaign_id = f"{now.strftime('%Y%m%dT%H%M%SZ')}-timerlat-campaign-{uuid.uuid4().hex[:8]}"
+    if args.design == "observer":
+        arms = ["timerlat_disabled", "timerlat_user"]
+        timerlat_arms = ["timerlat_user"]
+        power_intervention = None
+    else:
+        arms = ["timerlat_user_default", "timerlat_user_pm_qos"]
+        timerlat_arms = arms.copy()
+        power_intervention = {
+            "device": args.cpu_dma_latency_path,
+            "requested_us": args.dma_latency_us,
+            "effective_before_us": qos_initial_effective_us,
+            "arm": "timerlat_user_pm_qos",
+            "lifetime": "one open file descriptor held over each trial; close removes this request",
+        }
+
     campaign: dict[str, Any] = {
         "schema": "clockpressure.timerlat-campaign.v1",
         "campaign_id": campaign_id,
@@ -548,6 +682,8 @@ def run_campaign(args: argparse.Namespace) -> Path:
         "seed": seed,
         "host": snapshot_environment(args.host_alias),
         "design": {
+            "mode": args.design,
+            "arms": arms,
             "duration_sec": args.duration_sec,
             "period_us": args.period_us,
             "replicates": args.repeats,
@@ -557,7 +693,8 @@ def run_campaign(args: argparse.Namespace) -> Path:
             "cpu_load_workers": args.cpu_load_workers,
             "fifo_priority": args.fifo_priority,
             "timerlat_buffer_kb": args.buffer_kb,
-            "timerlat_arms": ["timerlat_disabled", "timerlat_user"],
+            "timerlat_arms": timerlat_arms,
+            "cpu_dma_latency_intervention": power_intervention,
             "conditions": ["baseline", "cpu_pressure", "recovery"],
             "timerlat_reader_clock": "CLOCK_MONOTONIC_RAW on worker-03; not an independent reference",
             "external_elapsed_time_reference": None,
@@ -577,9 +714,9 @@ def run_campaign(args: argparse.Namespace) -> Path:
 
     plan: list[tuple[int, str, str, str]] = []
     for replicate in range(1, args.repeats + 1):
-        arms = ["timerlat_disabled", "timerlat_user"]
-        randomizer.shuffle(arms)
-        for arm in arms:
+        randomized_arms = arms.copy()
+        randomizer.shuffle(randomized_arms)
+        for arm in randomized_arms:
             conditions = ["baseline", "cpu_pressure"]
             randomizer.shuffle(conditions)
             for condition in conditions:

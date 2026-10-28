@@ -1,7 +1,18 @@
+import hashlib
+import json
+import os
+import struct
+import tempfile
 import unittest
+from unittest import mock
+from pathlib import Path
 
-from analysis.analyze_timerlat_campaign import build_report
-from experiments.run_timerlat_campaign import _empty_trace, _option_enabled
+from analysis.analyze_timerlat_campaign import analyze_campaign, build_report
+from experiments.run_timerlat_campaign import (
+    CpuDmaLatencyRequest,
+    _empty_trace,
+    _option_enabled,
+)
 
 
 class TestTimerlatCampaignAnalysis(unittest.TestCase):
@@ -9,6 +20,7 @@ class TestTimerlatCampaignAnalysis(unittest.TestCase):
         campaign = {
             "campaign_id": "fixture-campaign",
             "status": "complete",
+            "design": {"probe_cpu": 6, "timerlat_cpu": 7},
             "trials": [
                 {
                     "replicate": 1,
@@ -32,12 +44,28 @@ class TestTimerlatCampaignAnalysis(unittest.TestCase):
                         "run_id": f"{arm}-{replicate}-{condition}",
                         "samples": 100,
                         "wakeup_lateness_ns": {"p99": baseline + delta},
+                        "paired_crossstamp_dynamics": {
+                            "least_squares_rate_difference_ppm": -0.3 + (0.00002 if condition == "cpu_pressure" else 0)
+                        },
+                        "internal_rate_comparisons": {
+                            "monotonic_vs_raw": {"difference_ppm_vs_raw": -11.5}
+                        },
+                        "environment_telemetry": {
+                            "cpu_idle_residency_pct_of_cpu_capacity_by_state_name": {
+                                "C10": 95 if condition == "baseline" else 50 if condition == "cpu_pressure" else 95
+                            },
+                            "cpu_idle_residency_pct_by_cpu_state_name": {
+                                "cpu6": {"C10": 80 if condition != "cpu_pressure" else 90},
+                                "cpu7": {"C10": 95 if condition != "cpu_pressure" else 70},
+                            },
+                        },
+                        "sample_cpu_migrations_between_adjacent_samples": 0,
                         "integrity": {"probe.jsonl": "ok"},
                     }
         timerlat = {}
         for replicate in (1, 2):
             for condition, irq in (("baseline", 100), ("cpu_pressure", 140), ("recovery", 105)):
-                timerlat[(replicate, condition)] = {
+                timerlat[("timerlat_user", replicate, condition)] = {
                     "irq": {"p99": irq},
                     "thread": {"p99": irq + 10},
                     "user_return": {"p99": irq + 20},
@@ -60,6 +88,30 @@ class TestTimerlatCampaignAnalysis(unittest.TestCase):
             ],
             40,
         )
+        self.assertAlmostEqual(
+            contrasts[("timerlat_disabled", "pressure_minus_baseline", "clockpressure_crossstamp_fit_rate")][
+                "paired_difference"]["median"
+            ],
+            0.00002,
+        )
+        self.assertEqual(
+            contrasts[("timerlat_disabled", "pressure_minus_baseline", "cpu_c10_aggregate_residency")][
+                "paired_difference"]["median"
+            ],
+            -45,
+        )
+        self.assertEqual(
+            contrasts[("timerlat_user", "pressure_minus_baseline", "probe_cpu_c10_residency")][
+                "paired_difference"]["median"
+            ],
+            10,
+        )
+        self.assertEqual(
+            contrasts[("timerlat_user", "pressure_minus_baseline", "timerlat_cpu_c10_residency")][
+                "paired_difference"]["median"
+            ],
+            -25,
+        )
         self.assertEqual(
             report["observer_effects"][0]["paired_difference"]["median"],
             10,
@@ -77,6 +129,128 @@ class TestTracefsHelpers(unittest.TestCase):
         self.assertTrue(_option_enabled("DEFAULTS OSNOISE_WORKLOAD", "OSNOISE_WORKLOAD"))
         self.assertFalse(_option_enabled("DEFAULTS NO_OSNOISE_WORKLOAD", "OSNOISE_WORKLOAD"))
         self.assertFalse(_option_enabled("DEFAULTS NO_OSNOISE_WORKLOAD OSNOISE_WORKLOAD", "OSNOISE_WORKLOAD"))
+
+    def test_campaign_analysis_reparses_checksumming_raw_trace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            trace_dir = root / "timerlat" / "timerlat_user"
+            trace_dir.mkdir(parents=True)
+            trace = trace_dir / "sample.trace"
+            trace.write_text(
+                "<idle>-0 [007] d.h1. 1.0: #1 context irq timer_latency 20 ns\n"
+                "<...>-12 [007] ....1 1.1: #1 context thread timer_latency 30 ns\n"
+                "<idle>-0 [007] d.h1. 2.0: #2 context irq timer_latency 25 ns\n"
+                "<...>-12 [007] ....1 2.1: #2 context thread timer_latency 35 ns\n"
+            )
+            campaign_path = root / "campaign.json"
+            campaign_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "clockpressure.timerlat-campaign.v1",
+                        "campaign_id": "raw-trace-fixture",
+                        "status": "complete",
+                        "trials": [
+                            {
+                                "arm": "timerlat_user",
+                                "condition": "baseline",
+                                "replicate": 1,
+                                "status": "complete",
+                                "timerlat_trace": "/worker/archive/timerlat/timerlat_user/sample.trace",
+                                "timerlat_trace_sha256": hashlib.sha256(trace.read_bytes()).hexdigest(),
+                                "timerlat_analysis_summary": {"irq": {"p99": 999}},
+                                "tracefs_restoration": {
+                                    "cpu_buffer_stats": "entries: 4\noverrun: 0\ncommit overrun: 0\ndropped events: 0\n"
+                                },
+                            }
+                        ],
+                    }
+                )
+            )
+
+            report = analyze_campaign(campaign_path)
+            result = report["per_trial"][0]
+            self.assertEqual(result["timerlat_trace_integrity"], "ok")
+            self.assertEqual(result["timerlat_p99_ns"]["irq"], 25)
+            self.assertEqual(result["timerlat_p99_ns"]["thread"], 35)
+            self.assertEqual(result["timerlat_activation_integrity"]["matched_irq_thread_activations"], 2)
+            self.assertEqual(result["timerlat_buffer_stats"]["overrun"], 0)
+            self.assertEqual(report["timerlat_integrity"]["trace_buffer_dropped_events"], 0)
+
+    def test_qos_campaign_compares_default_and_intervention_arms(self):
+        campaign = {
+            "campaign_id": "qos-fixture",
+            "status": "complete",
+            "design": {
+                "arms": ["timerlat_user_default", "timerlat_user_pm_qos"],
+                "timerlat_arms": ["timerlat_user_default", "timerlat_user_pm_qos"],
+                "cpu_dma_latency_intervention": {
+                    "arm": "timerlat_user_pm_qos",
+                    "requested_us": 0,
+                },
+            },
+            "trials": [],
+        }
+        probes = {}
+        timers = {}
+        for arm, delta in (("timerlat_user_default", 0), ("timerlat_user_pm_qos", -100)):
+            for condition, condition_delta in (("baseline", 0), ("cpu_pressure", -10), ("recovery", 0)):
+                probes[(arm, 1, condition)] = {
+                    "wakeup_lateness_ns": {"p99": 1000 + delta + condition_delta},
+                    "paired_crossstamp_dynamics": {"least_squares_rate_difference_ppm": -0.3},
+                    "integrity": {},
+                }
+                timers[(arm, 1, condition)] = {
+                    "irq": {"p99": 300 + delta + condition_delta},
+                    "thread": {"p99": 350 + delta + condition_delta},
+                    "user_return": {"p99": 400 + delta + condition_delta},
+                }
+        report = build_report(campaign, probes, timers)
+        effects = {
+            (item["condition"], item["metric"]): item
+            for item in report["intervention_effects"]
+        }
+        self.assertEqual(
+            effects[("baseline", "clockpressure_wakeup_p99")]["paired_difference"]["median"],
+            -100,
+        )
+        self.assertEqual(
+            effects[("baseline", "timerlat_irq_p99")]["paired_difference"]["median"],
+            -100,
+        )
+
+    def test_cpu_dma_latency_request_is_applied_and_released(self):
+        effective = {"value": 2_000_000_000}
+
+        def fake_open(_path, flags):
+            return 11 if flags & os.O_RDWR else 10
+
+        def fake_read(_fd, _length):
+            return struct.pack("=i", effective["value"])
+
+        def fake_write(_fd, value):
+            effective["value"] = struct.unpack("=i", value)[0]
+            return len(value)
+
+        def fake_close(fd):
+            if fd == 11:
+                effective["value"] = 2_000_000_000
+
+        with (
+            mock.patch.object(Path, "is_char_device", return_value=True),
+            mock.patch("experiments.run_timerlat_campaign.os.open", side_effect=fake_open),
+            mock.patch("experiments.run_timerlat_campaign.os.read", side_effect=fake_read),
+            mock.patch("experiments.run_timerlat_campaign.os.write", side_effect=fake_write),
+            mock.patch("experiments.run_timerlat_campaign.os.close", side_effect=fake_close),
+        ):
+            request = CpuDmaLatencyRequest(Path("/dev/cpu_dma_latency"), 0)
+            request.start()
+            self.assertEqual(effective["value"], 0)
+            state = request.close()
+
+        self.assertEqual(state["effective_before_us"], 2_000_000_000)
+        self.assertEqual(state["effective_during_us"], 0)
+        self.assertEqual(state["effective_after_us"], 2_000_000_000)
+        self.assertTrue(state["restored"])
 
 
 if __name__ == "__main__":
