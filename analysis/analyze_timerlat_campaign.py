@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from analysis.analyze_runs import _bootstrap_mean_interval, _quantiles, analyze
+from analysis.analyze_idle_transitions import analyze_idle_transitions
 from analysis.analyze_timerlat import analyze_trace
 
 _PROBE_METRICS = {
@@ -339,6 +340,7 @@ def build_report(
                 ) if arm in timerlat_arms else None,
                 "timerlat_user_worker": trial.get("timerlat_user_worker") if arm in timerlat_arms else None,
                 "cpu_dma_latency_request": trial.get("cpu_dma_latency_request"),
+                "cpu_idle_transition_analysis": trial.get("cpu_idle_transition_summary"),
             }
         )
 
@@ -455,6 +457,12 @@ def analyze_campaign(campaign_path: Path) -> dict[str, Any]:
                 probe_summaries[(arm, int(replicate), str(condition))] = run
 
     timerlat_summaries: dict[tuple[str, int, str], dict[str, Any]] = {}
+    idle_tracepoint = campaign.get("design", {}).get("cpu_idle_tracepoint")
+    idle_cpu = int(idle_tracepoint["cpu"]) if idle_tracepoint else None
+    idle_state_names = {
+        int(key): str(value)
+        for key, value in (idle_tracepoint.get("state_names", {}) if idle_tracepoint else {}).items()
+    }
     for trial in campaign.get("trials", []):
         arm = str(trial.get("arm"))
         if arm not in timerlat_arms:
@@ -482,6 +490,13 @@ def analyze_campaign(campaign_path: Path) -> dict[str, Any]:
             "duplicate_activation_events": parsed["duplicate_activation_event_count"],
             "malformed_latency_lines": parsed["malformed_latency_line_count"],
         }
+        if idle_cpu is not None:
+            idle_analysis = analyze_idle_transitions(
+                trace_path,
+                cpu=idle_cpu,
+                state_names=idle_state_names,
+            )
+            trial["cpu_idle_transition_summary"] = idle_analysis
         timerlat_summaries[key] = parsed["latency_ns"]
 
     report = build_report(campaign, probe_summaries, timerlat_summaries)

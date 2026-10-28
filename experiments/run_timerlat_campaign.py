@@ -23,6 +23,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from analysis.analyze_timerlat import analyze_trace
+from analysis.analyze_idle_transitions import analyze_idle_transitions
 from experiments.environment import snapshot_environment
 from experiments.run_trial import _parse_cpus, _write_json
 
@@ -70,26 +71,39 @@ def _option_enabled(options: str, option: str) -> bool:
 class TracefsTimerlat:
     """Manage the global timerlat tracer and restore its previously idle state."""
 
-    def __init__(self, tracefs: Path, cpu: int, period_us: int, buffer_kb: int):
+    def __init__(
+        self,
+        tracefs: Path,
+        cpu: int,
+        period_us: int,
+        buffer_kb: int,
+        cpu_idle_cpu: int | None = None,
+    ):
         self.tracefs = tracefs
         self.cpu = cpu
         self.period_us = period_us
         self.buffer_kb = buffer_kb
+        self.cpu_idle_cpu = cpu_idle_cpu
         self.changed = False
         self.before = self._settings()
         self._check_idle_state()
 
     def _settings(self) -> dict[str, Any]:
         options = _read(self.tracefs / "osnoise/options")
+        idle_event = self.tracefs / "events/power/cpu_idle"
+        trace_clock_path = self.tracefs / "trace_clock"
         return {
             "current_tracer": _read(self.tracefs / "current_tracer"),
             "tracing_on": _read(self.tracefs / "tracing_on"),
             "buffer_size_kb": _read(self.tracefs / "buffer_size_kb"),
+            "trace_clock": _read(trace_clock_path) if trace_clock_path.exists() else None,
             "timerlat_period_us": _read(self.tracefs / "osnoise/timerlat_period_us"),
             "osnoise_cpus": _read(self.tracefs / "osnoise/cpus"),
             "osnoise_workload_enabled": _option_enabled(options, "OSNOISE_WORKLOAD"),
             "osnoise_options_raw": options,
             "enabled_events": _read(self.tracefs / "set_event"),
+            "cpu_idle_event_enabled": _read(idle_event / "enable") if (idle_event / "enable").exists() else None,
+            "cpu_idle_event_filter": _read(idle_event / "filter") if (idle_event / "filter").exists() else None,
             "trace_empty": _empty_trace((self.tracefs / "trace").read_text(errors="replace")),
         }
 
@@ -102,6 +116,11 @@ class TracefsTimerlat:
             raise RuntimeError("tracefs has enabled events; refusing to disturb another trace")
         if not settings["trace_empty"]:
             raise RuntimeError("tracefs buffer has retained events; refusing to clear them")
+        if self.cpu_idle_cpu is not None and (
+            settings["cpu_idle_event_enabled"] is None
+            or settings["cpu_idle_event_filter"] is None
+        ):
+            raise RuntimeError("the active tracefs does not expose the power:cpu_idle tracepoint")
         available = set(_read(self.tracefs / "available_tracers").split())
         if "timerlat" not in available:
             raise RuntimeError("the active tracefs does not expose the timerlat tracer")
@@ -113,6 +132,12 @@ class TracefsTimerlat:
         _write(self.tracefs / "buffer_size_kb", str(self.buffer_kb))
         _write(self.tracefs / "osnoise/cpus", str(self.cpu))
         _write(self.tracefs / "osnoise/timerlat_period_us", str(self.period_us))
+        if self.cpu_idle_cpu is not None:
+            idle_event = self.tracefs / "events/power/cpu_idle"
+            _write(idle_event / "filter", f"cpu_id == {self.cpu_idle_cpu}")
+            _write(idle_event / "enable", "1")
+            if _read(idle_event / "enable") != "1":
+                raise RuntimeError("the power:cpu_idle tracepoint did not become enabled")
         if self.before["osnoise_workload_enabled"]:
             _write(self.tracefs / "osnoise/options", "NO_OSNOISE_WORKLOAD")
         _write(self.tracefs / "current_tracer", "timerlat")
@@ -138,6 +163,16 @@ class TracefsTimerlat:
         except Exception as exc:  # restoration still takes priority over collection
             errors.append(exc)
         finally:
+            if self.cpu_idle_cpu is not None:
+                idle_event = self.tracefs / "events/power/cpu_idle"
+                for path, value in (
+                    (idle_event / "enable", self.before["cpu_idle_event_enabled"] or "0"),
+                    (idle_event / "filter", self.before["cpu_idle_event_filter"] or "none"),
+                ):
+                    try:
+                        _write(path, value)
+                    except Exception as exc:
+                        errors.append(exc)
             restore_actions = [
                 (self.tracefs / "current_tracer", "nop"),
                 (self.tracefs / "trace", ""),
@@ -179,10 +214,13 @@ class TracefsTimerlat:
                 "current_tracer",
                 "tracing_on",
                 "buffer_size_kb",
+                "trace_clock",
                 "timerlat_period_us",
                 "osnoise_cpus",
                 "osnoise_workload_enabled",
                 "enabled_events",
+                "cpu_idle_event_enabled",
+                "cpu_idle_event_filter",
                 "trace_empty",
             )
         )
@@ -274,6 +312,22 @@ def _parse_cpus_arg(value: str) -> list[int]:
     except argparse.ArgumentTypeError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
     return cpus
+
+
+def _cpuidle_state_names(cpu: int) -> dict[str, str]:
+    state_root = Path(f"/sys/devices/system/cpu/cpu{cpu}/cpuidle")
+    names = {}
+    states = sorted(
+        state_root.glob("state*"),
+        key=lambda path: int(path.name.removeprefix("state")),
+    )
+    for state in states:
+        name_path = state / "name"
+        if name_path.is_file():
+            names[state.name.removeprefix("state")] = _read(name_path)
+    if not names:
+        raise RuntimeError(f"no named cpuidle states are available for CPU {cpu}")
+    return names
 
 
 def _trial_command(
@@ -418,7 +472,13 @@ def _run_trial(
 
     if timerlat_enabled:
         trace_session = TracefsTimerlat(
-            Path(args.tracefs_root), args.timerlat_cpu, args.period_us, args.buffer_kb
+            Path(args.tracefs_root),
+            args.timerlat_cpu,
+            args.period_us,
+            args.buffer_kb,
+            cpu_idle_cpu=(
+                args.timerlat_cpu if getattr(args, "capture_cpu_idle", False) else None
+            ),
         )
     qos_requested_value = _qos_requested_value(args, arm)
     if qos_requested_value is not None:
@@ -555,6 +615,25 @@ def _run_trial(
                 "duplicate_activation_events": analysis["duplicate_activation_event_count"],
                 "malformed_latency_lines": analysis["malformed_latency_line_count"],
             }
+            if getattr(args, "capture_cpu_idle", False):
+                state_names = {
+                    int(key): value
+                    for key, value in _cpuidle_state_names(args.timerlat_cpu).items()
+                }
+                idle_analysis = analyze_idle_transitions(
+                    trace_path,
+                    cpu=args.timerlat_cpu,
+                    state_names=state_names,
+                )
+                idle_analysis_path = timerlat_dir / f"{run_id}.idle-analysis.json"
+                _write_json(idle_analysis_path, idle_analysis)
+                entry["cpu_idle_transition_analysis"] = _relative_artifact(
+                    idle_analysis_path, out
+                )
+                entry["cpu_idle_transition_summary"] = idle_analysis
+                if idle_analysis["cpu_idle_events"] == 0:
+                    entry["error"] = "power:cpu_idle capture produced no events"
+                    entry["status"] = "failed"
             entry["tracefs_restoration"] = {
                 key: value for key, value in trace_record.items() if key != "trace"
             }
@@ -597,6 +676,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timerlat-cpu", type=int, default=7)
     parser.add_argument("--fifo-priority", type=int, default=90)
     parser.add_argument("--buffer-kb", type=int, default=2048)
+    parser.add_argument(
+        "--capture-cpu-idle",
+        action="store_true",
+        help="record power:cpu_idle transitions on the selected timerlat CPU",
+    )
     parser.add_argument("--warmup-sec", type=float, default=5)
     parser.add_argument("--recovery-seconds", type=int, default=5)
     parser.add_argument(
@@ -676,6 +760,16 @@ def run_campaign(args: argparse.Namespace) -> Path:
                 f"current={qos_initial_effective_us} us, targets={qos_targets} us"
             )
 
+    capture_cpu_idle = getattr(args, "capture_cpu_idle", False)
+    cpu_idle_state_names = _cpuidle_state_names(args.timerlat_cpu) if capture_cpu_idle else None
+    initial_tracefs = TracefsTimerlat(
+        Path(args.tracefs_root),
+        args.timerlat_cpu,
+        args.period_us,
+        args.buffer_kb,
+        cpu_idle_cpu=args.timerlat_cpu if capture_cpu_idle else None,
+    )
+
     out = Path(args.data_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=False, mode=0o700)
     os.chmod(out, 0o700)
@@ -742,10 +836,19 @@ def run_campaign(args: argparse.Namespace) -> Path:
             "pressure_workload": "four bounded nice +10 CPU spin workers, pinned to configured load CPUs",
             "timerlat_user_workload": "one pinned SCHED_FIFO reader of timerlat_fd; no explicit computation",
             "control_clock_probe": "ClockPressure absolute CLOCK_MONOTONIC sampler pinned to probe CPU",
+            "cpu_idle_tracepoint": (
+                {
+                    "event": "power:cpu_idle",
+                    "cpu": args.timerlat_cpu,
+                    "state_names": cpu_idle_state_names,
+                    "trace_clock": initial_tracefs.before["trace_clock"],
+                    "semantics": "state index marks entry; 4294967295 marks exit from the prior state",
+                }
+                if capture_cpu_idle
+                else None
+            ),
         },
-        "initial_tracefs_state": TracefsTimerlat(
-            Path(args.tracefs_root), args.timerlat_cpu, args.period_us, args.buffer_kb
-        ).before,
+        "initial_tracefs_state": initial_tracefs.before,
         "trials": [],
         "status": "running",
         "data_dir": str(out),

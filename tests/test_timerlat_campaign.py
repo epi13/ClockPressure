@@ -12,6 +12,7 @@ from analysis.analyze_timerlat_campaign import analyze_campaign, build_report
 import experiments.run_timerlat_campaign as timerlat_runner
 from experiments.run_timerlat_campaign import (
     CpuDmaLatencyRequest,
+    TracefsTimerlat,
     _empty_trace,
     _option_enabled,
 )
@@ -135,6 +136,64 @@ class TestTimerlatCampaignAnalysis(unittest.TestCase):
 
 
 class TestTracefsHelpers(unittest.TestCase):
+    def test_cpu_idle_tracepoint_filter_is_enabled_and_restored(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            files = {
+                "current_tracer": "nop\n",
+                "tracing_on": "1\n",
+                "buffer_size_kb": "7\n",
+                "trace_clock": "local global counter\n",
+                "available_tracers": "nop timerlat\n",
+                "set_event": "\n",
+                "trace": "# entries-in-buffer/entries-written: 0/0 #P:8\n",
+                "osnoise/options": "NO_OSNOISE_WORKLOAD\n",
+                "osnoise/cpus": "0-7\n",
+                "osnoise/timerlat_period_us": "1000\n",
+                "events/power/cpu_idle/enable": "0\n",
+                "events/power/cpu_idle/filter": "none\n",
+                "osnoise/per_cpu/cpu7/timerlat_fd": "",
+                "per_cpu/cpu7/stats": "entries: 0\noverrun: 0\n",
+            }
+            for relative, value in files.items():
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(value)
+
+            before = {
+                "current_tracer": "nop",
+                "tracing_on": "1",
+                "buffer_size_kb": "7",
+                "trace_clock": "local global counter",
+                "timerlat_period_us": "1000",
+                "osnoise_cpus": "0-7",
+                "osnoise_workload_enabled": False,
+                "osnoise_options_raw": "NO_OSNOISE_WORKLOAD",
+                "enabled_events": "",
+                "cpu_idle_event_enabled": "0",
+                "cpu_idle_event_filter": "none",
+                "trace_empty": True,
+            }
+            with mock.patch.object(
+                TracefsTimerlat,
+                "_settings",
+                side_effect=[before, before.copy()],
+            ):
+                tracefs = TracefsTimerlat(root, 7, 10000, 64, cpu_idle_cpu=7)
+                tracefs.start()
+                self.assertEqual((root / "events/power/cpu_idle/enable").read_text().strip(), "1")
+                self.assertEqual(
+                    (root / "events/power/cpu_idle/filter").read_text().strip(),
+                    "cpu_id == 7",
+                )
+                result = tracefs.stop_and_restore()
+
+            self.assertTrue(result["restored"])
+            self.assertEqual((root / "events/power/cpu_idle/enable").read_text().strip(), "0")
+            self.assertEqual((root / "events/power/cpu_idle/filter").read_text().strip(), "none")
+            self.assertEqual((root / "current_tracer").read_text().strip(), "nop")
+            self.assertEqual((root / "tracing_on").read_text().strip(), "1")
+
     def test_trace_empty_requires_zero_entries_written(self):
         self.assertTrue(_empty_trace("# entries-in-buffer/entries-written: 0/0 #P:8\n"))
         self.assertFalse(_empty_trace("# entries-in-buffer/entries-written: 0/4 #P:8\n"))
@@ -192,6 +251,57 @@ class TestTracefsHelpers(unittest.TestCase):
             self.assertEqual(result["timerlat_buffer_stats"]["overrun"], 0)
             self.assertEqual(report["timerlat_integrity"]["trace_buffer_dropped_events"], 0)
             self.assertEqual(report["timerlat_integrity"]["user_return_activations"], 1)
+
+    def test_campaign_analysis_joins_cpu_idle_state_to_timerlat_irq(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            trace_dir = root / "timerlat" / "timerlat_user"
+            trace_dir.mkdir(parents=True)
+            trace = trace_dir / "sample.trace"
+            trace.write_text(
+                "swapper/7-0 [007] .... 1.000000: cpu_idle: state=8 cpu_id=7\n"
+                "<idle>-0 [007] d.h1. 1.000100: #1 context irq timer_latency 30000 ns\n"
+                "<...>-12 [007] ....1 1.000110: #1 context thread timer_latency 31000 ns\n"
+                "<...>-12 [007] ....1 1.000120: #1 context user-ret timer_latency 32000 ns\n"
+                "swapper/7-0 [007] .... 1.000200: cpu_idle: state=4294967295 cpu_id=7\n"
+            )
+            campaign_path = root / "campaign.json"
+            campaign_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "clockpressure.timerlat-campaign.v1",
+                        "campaign_id": "idle-transition-fixture",
+                        "status": "complete",
+                        "design": {
+                            "arms": ["timerlat_user"],
+                            "timerlat_arms": ["timerlat_user"],
+                            "cpu_idle_tracepoint": {
+                                "event": "power:cpu_idle",
+                                "cpu": 7,
+                                "state_names": {"8": "C10"},
+                            },
+                        },
+                        "trials": [
+                            {
+                                "arm": "timerlat_user",
+                                "condition": "baseline",
+                                "replicate": 1,
+                                "status": "complete",
+                                "timerlat_trace": "timerlat/timerlat_user/sample.trace",
+                                "timerlat_trace_sha256": hashlib.sha256(trace.read_bytes()).hexdigest(),
+                            }
+                        ],
+                    }
+                )
+            )
+
+            report = analyze_campaign(campaign_path)
+
+        idle = report["per_trial"][0]["cpu_idle_transition_analysis"]
+        self.assertEqual(idle["timerlat_irq_events"], 1)
+        self.assertEqual(idle["matched_idle_state_activations"], 1)
+        self.assertEqual(idle["per_state"][0]["state_name"], "C10")
+        self.assertEqual(idle["per_state"][0]["timerlat_irq_latency_ns"]["p99"], 30000)
 
     def test_analyzer_flags_complete_manifest_with_failed_trial(self):
         with tempfile.TemporaryDirectory() as temporary:
