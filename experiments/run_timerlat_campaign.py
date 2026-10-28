@@ -9,6 +9,7 @@ import os
 import random
 import re
 import signal
+import shutil
 import struct
 import subprocess
 import sys
@@ -101,6 +102,124 @@ def _option_enabled(options: str, option: str) -> bool:
     if f"NO_{option}" in words:
         return False
     return option in words
+
+
+_TURBOSTAT_FIELDS = (
+    "Time_Of_Day_Seconds,CPU,Core,Busy%,Bzy_MHz,C10%,"
+    "Pkg%pc6,Pk%pc10,PkgWatt,PkgTmp"
+)
+
+
+class TurbostatSampler:
+    """Capture package and selected-CPU counters while a campaign runs."""
+
+    def __init__(self, output_path: Path, *, cpu: int, interval_sec: float):
+        self.output_path = output_path
+        self.stderr_path = output_path.with_suffix(".stderr")
+        self.cpu = cpu
+        self.interval_sec = interval_sec
+        self.binary: str | None = None
+        self.process: subprocess.Popen[bytes] | None = None
+        self.stderr_stream = None
+        self.started_at_utc: str | None = None
+        self.stopped_at_utc: str | None = None
+
+    def _has_sample(self) -> bool:
+        try:
+            lines = self.output_path.read_text(errors="replace").splitlines()
+        except OSError:
+            return False
+        for line in lines:
+            first, separator, _rest = line.partition("\t")
+            if separator:
+                try:
+                    float(first)
+                    return True
+                except ValueError:
+                    continue
+        return False
+
+    def start(self) -> None:
+        self.binary = shutil.which("turbostat")
+        if self.binary is None:
+            raise RuntimeError("turbostat capture requested but turbostat is unavailable")
+        self.stderr_stream = self.stderr_path.open("wb")
+        command = [
+            self.binary,
+            "--quiet",
+            "--interval",
+            str(self.interval_sec),
+            "--cpu",
+            str(self.cpu),
+            "--show",
+            _TURBOSTAT_FIELDS,
+            "--out",
+            str(self.output_path),
+        ]
+        self.started_at_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        self.process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=self.stderr_stream,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                raise RuntimeError(
+                    f"turbostat exited before producing a sample (return code={self.process.returncode})"
+                )
+            if self._has_sample():
+                return
+            time.sleep(0.1)
+        raise RuntimeError("turbostat did not produce a timestamped sample within 10 seconds")
+
+    def stop(self) -> dict[str, Any]:
+        return_code: int | None = None
+        if self.process is not None:
+            if self.process.poll() is None:
+                try:
+                    os.killpg(self.process.pid, signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+            try:
+                return_code = self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(self.process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    return_code = self.process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(self.process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    return_code = self.process.wait(timeout=2)
+        if self.stderr_stream is not None:
+            self.stderr_stream.close()
+            self.stderr_stream = None
+        if self.output_path.exists():
+            os.chmod(self.output_path, 0o600)
+        if self.stderr_path.exists():
+            os.chmod(self.stderr_path, 0o600)
+        self.stopped_at_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        return {
+            "binary": self.binary,
+            "cpu": self.cpu,
+            "interval_seconds": self.interval_sec,
+            "fields": _TURBOSTAT_FIELDS.split(","),
+            "clock_domain": "Time_Of_Day_Seconds for alignment only; not an independent elapsed-time reference",
+            "output": self.output_path.name,
+            "stderr": self.stderr_path.name,
+            "started_at_utc": self.started_at_utc,
+            "stopped_at_utc": self.stopped_at_utc,
+            "returncode": return_code,
+            "expected_stop_returncodes": [0, -signal.SIGINT, 128 + signal.SIGINT],
+            "output_bytes": self.output_path.stat().st_size if self.output_path.exists() else 0,
+        }
 
 
 class TracefsTimerlat:
@@ -759,6 +878,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="record power:cpu_idle transitions on the selected timerlat CPU",
     )
+    parser.add_argument(
+        "--capture-turbostat",
+        action="store_true",
+        help="sample CPU7/package residency, frequency, power, and temperature during the campaign",
+    )
+    parser.add_argument("--turbostat-cpu", type=int)
+    parser.add_argument("--turbostat-interval-sec", type=float, default=1.0)
     parser.add_argument("--warmup-sec", type=float, default=5)
     parser.add_argument("--recovery-seconds", type=int, default=5)
     parser.add_argument(
@@ -782,6 +908,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_campaign(args: argparse.Namespace) -> Path:
+    args.capture_turbostat = getattr(args, "capture_turbostat", False)
+    args.turbostat_cpu = getattr(args, "turbostat_cpu", None)
+    args.turbostat_interval_sec = getattr(args, "turbostat_interval_sec", 1.0)
     if os.geteuid() != 0:
         raise RuntimeError("tracefs timerlat collection requires root; run under sudo")
     if not 1 <= args.duration_sec <= 3600:
@@ -802,6 +931,8 @@ def run_campaign(args: argparse.Namespace) -> Path:
         raise ValueError("--intertrial-cooldown-sec must be in 0..600")
     if args.warmup_sec < 0 or args.warmup_sec > 30:
         raise ValueError("--warmup-sec must be in 0..30")
+    if not 0.1 <= args.turbostat_interval_sec <= 60:
+        raise ValueError("--turbostat-interval-sec must be in 0.1..60")
     if not 1 <= args.fifo_priority <= 99:
         raise ValueError("--fifo-priority must be in 1..99")
     if not 0 <= args.dma_latency_us <= 2_000_000_000:
@@ -818,6 +949,9 @@ def run_campaign(args: argparse.Namespace) -> Path:
     requested_cpus = set(args.load_cpus) | {args.probe_cpu, args.timerlat_cpu}
     if not requested_cpus.issubset(online_cpus):
         raise ValueError(f"requested CPUs {sorted(requested_cpus)} must be online in {sorted(online_cpus)}")
+    turbostat_cpu = args.turbostat_cpu if args.turbostat_cpu is not None else args.timerlat_cpu
+    if args.capture_turbostat and turbostat_cpu not in online_cpus:
+        raise ValueError(f"turbostat CPU {turbostat_cpu} must be online")
     if not TRIAL.is_file() or not TIMERLAT_WORKER.is_file():
         raise RuntimeError("ClockPressure trial or timerlat user worker is missing")
     if not (ROOT / "build" / "clockpressure-probe").is_file():
@@ -914,6 +1048,16 @@ def run_campaign(args: argparse.Namespace) -> Path:
             "pressure_workload": "four bounded nice +10 CPU spin workers, pinned to configured load CPUs",
             "timerlat_user_workload": "one pinned SCHED_FIFO reader of timerlat_fd; no explicit computation",
             "control_clock_probe": "ClockPressure absolute CLOCK_MONOTONIC sampler pinned to probe CPU",
+            "turbostat": (
+                {
+                    "cpu": args.turbostat_cpu if args.turbostat_cpu is not None else args.timerlat_cpu,
+                    "interval_seconds": args.turbostat_interval_sec,
+                    "fields": _TURBOSTAT_FIELDS.split(","),
+                    "timestamp_semantics": "wall-clock label for alignment; not an independent elapsed-time reference",
+                }
+                if args.capture_turbostat
+                else None
+            ),
             "cpu_idle_tracepoint": (
                 {
                     "event": "power:cpu_idle",
@@ -953,7 +1097,30 @@ def run_campaign(args: argparse.Namespace) -> Path:
     _write_json(campaign_path, campaign)
 
     total = len(plan)
+    turbostat_sampler = None
+    if args.capture_turbostat:
+        turbostat_sampler = TurbostatSampler(
+            out / "turbostat.tsv",
+            cpu=turbostat_cpu,
+            interval_sec=args.turbostat_interval_sec,
+        )
+        campaign["turbostat_capture"] = {
+            "status": "starting",
+            "output": "turbostat.tsv",
+            "stderr": "turbostat.stderr",
+            "cpu": turbostat_cpu,
+            "interval_seconds": args.turbostat_interval_sec,
+            "fields": _TURBOSTAT_FIELDS.split(","),
+        }
+        _write_json(campaign_path, campaign)
     try:
+        if turbostat_sampler is not None:
+            turbostat_sampler.start()
+            campaign["turbostat_capture"]["status"] = "running"
+            campaign["turbostat_capture"]["started_at_utc"] = (
+                turbostat_sampler.started_at_utc
+            )
+            _write_json(campaign_path, campaign)
         for ordinal, (replicate, arm, condition, role) in enumerate(plan, start=1):
             print(
                 f"[{ordinal}/{total}] replicate={replicate} arm={arm} condition={condition}",
@@ -992,6 +1159,39 @@ def run_campaign(args: argparse.Namespace) -> Path:
     else:
         if campaign["status"] == "running":
             campaign["status"] = "complete"
+    finally:
+        if turbostat_sampler is not None:
+            try:
+                capture_record = turbostat_sampler.stop()
+                campaign["turbostat_capture"].update(capture_record)
+                has_sample = turbostat_sampler._has_sample()
+                campaign["turbostat_capture"]["status"] = (
+                    "stopped" if has_sample else "failed"
+                )
+                if not has_sample:
+                    campaign["status"] = "failed"
+                    campaign["failure"] = campaign.get("failure") or (
+                        "turbostat capture produced no timestamped sample"
+                    )
+                if (
+                    capture_record["returncode"] is not None
+                    and capture_record["returncode"]
+                    not in capture_record["expected_stop_returncodes"]
+                ):
+                    campaign["status"] = "failed"
+                    campaign["failure"] = (
+                        "turbostat collector exited unexpectedly: "
+                        f"{capture_record['returncode']}"
+                    )
+            except Exception as exc:
+                campaign["turbostat_capture"]["status"] = "failed"
+                campaign["turbostat_capture"]["error"] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                campaign["status"] = "failed"
+                campaign["failure"] = campaign.get("failure") or (
+                    f"turbostat capture cleanup failed: {type(exc).__name__}: {exc}"
+                )
     campaign["finished_at_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     _write_json(campaign_path, campaign)
     print(campaign_path)

@@ -13,6 +13,7 @@ import experiments.run_timerlat_campaign as timerlat_runner
 from experiments.run_timerlat_campaign import (
     CpuDmaLatencyRequest,
     TracefsTimerlat,
+    TurbostatSampler,
     _empty_trace,
     _cpu_buffer_integrity,
     _normalized_event_filter,
@@ -138,6 +139,40 @@ class TestTimerlatCampaignAnalysis(unittest.TestCase):
 
 
 class TestTracefsHelpers(unittest.TestCase):
+    def test_turbostat_sampler_waits_for_timestamped_data_and_stops_cleanly(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "turbostat.tsv"
+            fake_process = mock.Mock()
+            fake_process.pid = 4242
+            fake_process.poll.return_value = None
+            fake_process.wait.return_value = 130
+
+            def fake_popen(command, **_kwargs):
+                sample_path = Path(command[command.index("--out") + 1])
+                sample_path.write_text(
+                    "Time_Of_Day_Seconds\tCPU\n1793172000.0\t7\n"
+                )
+                return fake_process
+
+            sampler = TurbostatSampler(output, cpu=7, interval_sec=0.5)
+            with (
+                mock.patch.object(timerlat_runner.shutil, "which", return_value="/usr/bin/turbostat"),
+                mock.patch.object(timerlat_runner.subprocess, "Popen", side_effect=fake_popen) as popen,
+                mock.patch.object(timerlat_runner.os, "killpg") as killpg,
+            ):
+                sampler.start()
+                record = sampler.stop()
+            output_bytes = output.stat().st_size
+            output_mode = output.stat().st_mode & 0o777
+
+        command = popen.call_args.args[0]
+        self.assertIn("0.5", command)
+        self.assertEqual(command[command.index("--cpu") + 1], "7")
+        self.assertEqual(record["returncode"], 130)
+        self.assertEqual(record["output_bytes"], output_bytes)
+        self.assertEqual(output_mode, 0o600)
+        killpg.assert_called_once_with(4242, timerlat_runner.signal.SIGINT)
+
     def test_cpu_buffer_integrity_parses_loss_counters(self):
         self.assertEqual(
             _cpu_buffer_integrity(
