@@ -160,6 +160,7 @@ def run_trial(args: argparse.Namespace) -> Path:
     probe_err_path = in_progress / "probe.stderr"
     ebpf_path = in_progress / "scheduler.jsonl"
     ebpf_err_path = in_progress / "scheduler.stderr"
+    ebpf_program_path = in_progress / "scheduler.generated.bt"
     workload_path = in_progress / "workload.jsonl"
     workload_err_path = in_progress / "workload.stderr"
     telemetry_path = in_progress / "telemetry.jsonl"
@@ -330,9 +331,25 @@ def run_trial(args: argparse.Namespace) -> Path:
                 "-n",
                 "bpftrace",
                 "-q",
-                f"-DCP_TARGET={probe_meta['pid']}",
-                str(BPF_PROGRAM),
+                str(ebpf_program_path),
             ]
+            target_pid = int(probe_meta["pid"])
+            if target_pid <= 1:
+                raise RuntimeError(f"invalid probe PID for scheduler attachment: {target_pid}")
+            template = BPF_PROGRAM.read_text(encoding="utf-8")
+            if "CP_TARGET" not in template:
+                raise RuntimeError("scheduler BPF template has no CP_TARGET placeholder")
+            generated_program = template.replace("CP_TARGET", str(target_pid))
+            ebpf_program_path.write_text(generated_program, encoding="utf-8")
+            os.chmod(ebpf_program_path, 0o600)
+            manifest["scheduler_observer"] = {
+                "target_pid": target_pid,
+                "template": "instrumentation/sched_wakeup.bt",
+                "generated_script": ebpf_program_path.name,
+                "generated_script_sha256": _sha256(ebpf_program_path),
+                "clock_id": "bpf_ktime_get_ns",
+            }
+            _write_json(in_progress / "manifest.json", manifest)
             observer_proc = _start_command(observer_cmd, observer_out, observer_err)
             time.sleep(0.5)
             if observer_proc.poll() is not None:
@@ -410,6 +427,7 @@ def run_trial(args: argparse.Namespace) -> Path:
             probe_err_path,
             ebpf_path,
             ebpf_err_path,
+            ebpf_program_path,
             workload_path,
             workload_err_path,
             telemetry_path,
