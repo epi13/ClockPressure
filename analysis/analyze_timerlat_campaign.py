@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any
+from datetime import datetime, timezone
 
 from analysis.analyze_runs import _bootstrap_mean_interval, _quantiles, analyze
+from analysis.analyze_idle_transitions import analyze_idle_transitions
 from analysis.analyze_timerlat import analyze_trace
 
 _PROBE_METRICS = {
@@ -66,6 +70,219 @@ def _parse_trace_buffer_stats(value: str | None) -> dict[str, int]:
     return stats
 
 
+_TURBOSTAT_METRICS = (
+    "Busy%",
+    "Bzy_MHz",
+    "C10%",
+    "Pkg%pc6",
+    "Pk%pc10",
+    "PkgWatt",
+    "PkgTmp",
+)
+_TURBOSTAT_UNITS = {
+    "Busy%": "percentage_points",
+    "Bzy_MHz": "MHz",
+    "C10%": "percentage_points",
+    "Pkg%pc6": "percentage_points",
+    "Pk%pc10": "percentage_points",
+    "PkgWatt": "W",
+    "PkgTmp": "degC",
+}
+_TURBOSTAT_CONTRAST_METRICS = tuple(
+    (f"turbostat_cpu_{metric}_median", unit)
+    for metric, unit in _TURBOSTAT_UNITS.items()
+)
+
+
+def _turbostat_median(
+    summaries: dict[tuple[str, int, str], dict[str, Any]],
+    key: tuple[str, int, str],
+    metric_name: str,
+) -> Any:
+    metric = metric_name.removeprefix("turbostat_cpu_").removesuffix("_median")
+    return (summaries.get(key, {}).get("metrics", {}).get(metric) or {}).get("median")
+
+
+def _read_probe_realtime_window(root: Path, trial: dict[str, Any]) -> tuple[float, float] | None:
+    """Return the probe's host CLOCK_REALTIME measurement window in epoch seconds."""
+    run_dir = trial.get("run_dir")
+    if not run_dir:
+        return None
+    recorded_run_path = Path(str(run_dir))
+    if recorded_run_path.is_absolute():
+        run_path = recorded_run_path if recorded_run_path.is_dir() else None
+    else:
+        candidate = root / recorded_run_path
+        run_path = candidate if candidate.is_dir() else None
+    if run_path is None or not run_path.is_dir():
+        return None
+    probe_path = run_path / "probe.jsonl"
+    if not probe_path.is_file():
+        return None
+    start_ns = end_ns = None
+    try:
+        with probe_path.open(encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("kind") == "start":
+                    start_ns = record.get("realtime_ns")
+                elif record.get("kind") == "end":
+                    end_ns = record.get("realtime_ns")
+    except OSError:
+        return None
+    if not isinstance(start_ns, int) or not isinstance(end_ns, int) or end_ns < start_ns:
+        return None
+    return start_ns / 1e9, end_ns / 1e9
+
+
+def _parse_turbostat_rows(path: Path, cpu: int) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Read CPU rows from turbostat TSV, accepting its repeated table headers."""
+    samples: list[dict[str, Any]] = []
+    diagnostics = {"header_rows": 0, "malformed_rows": 0, "cpu_rows": 0}
+    if not path.is_file():
+        return samples, diagnostics
+    header: list[str] | None = None
+    try:
+        with path.open(encoding="utf-8", errors="replace", newline="") as stream:
+            for row in csv.reader(stream, delimiter="\t"):
+                if not row or not any(cell.strip() for cell in row):
+                    continue
+                normalized = [cell.strip() for cell in row]
+                if normalized[0] == "Time_Of_Day_Seconds" and "CPU" in normalized:
+                    header = normalized
+                    diagnostics["header_rows"] += 1
+                    continue
+                if header is None or len(normalized) != len(header):
+                    diagnostics["malformed_rows"] += 1
+                    continue
+                item = dict(zip(header, normalized, strict=True))
+                if item.get("CPU") != str(cpu):
+                    continue
+                diagnostics["cpu_rows"] += 1
+                try:
+                    timestamp = float(item["Time_Of_Day_Seconds"])
+                except (KeyError, ValueError):
+                    diagnostics["malformed_rows"] += 1
+                    continue
+                if not math.isfinite(timestamp):
+                    diagnostics["malformed_rows"] += 1
+                    continue
+                numeric: dict[str, float] = {}
+                for metric in _TURBOSTAT_METRICS:
+                    value = item.get(metric)
+                    if value in (None, "", "-"):
+                        continue
+                    try:
+                        parsed = float(value)
+                    except ValueError:
+                        continue
+                    if math.isfinite(parsed):
+                        numeric[metric] = parsed
+                samples.append({"timestamp_epoch_seconds": timestamp, "metrics": numeric})
+    except OSError:
+        return [], diagnostics
+    samples.sort(key=lambda sample: sample["timestamp_epoch_seconds"])
+    return samples, diagnostics
+
+
+def _iso_epoch(epoch_seconds: float | None) -> str | None:
+    if epoch_seconds is None:
+        return None
+    return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _summarize_turbostat_window(
+    samples: list[dict[str, Any]], window: tuple[float, float] | None, cpu: int
+) -> dict[str, Any]:
+    if window is None:
+        return {
+            "status": "unavailable",
+            "cpu": cpu,
+            "sample_count": 0,
+            "reason": "probe CLOCK_REALTIME start/end markers are unavailable",
+        }
+    start, end = window
+    selected = [
+        sample
+        for sample in samples
+        if start <= sample["timestamp_epoch_seconds"] <= end
+    ]
+    result: dict[str, Any] = {
+        "status": "aligned" if selected else "no_samples_in_window",
+        "cpu": cpu,
+        "sample_count": len(selected),
+        "probe_window_start_host_realtime_utc": _iso_epoch(start),
+        "probe_window_end_host_realtime_utc": _iso_epoch(end),
+        "sample_first_host_realtime_utc": _iso_epoch(
+            selected[0]["timestamp_epoch_seconds"] if selected else None
+        ),
+        "sample_last_host_realtime_utc": _iso_epoch(
+            selected[-1]["timestamp_epoch_seconds"] if selected else None
+        ),
+        "sample_label_span_seconds": (
+            selected[-1]["timestamp_epoch_seconds"] - selected[0]["timestamp_epoch_seconds"]
+            if len(selected) > 1
+            else 0.0 if selected else None
+        ),
+        "metrics": {},
+        "join_clock": "worker CLOCK_REALTIME probe markers matched to turbostat Time_Of_Day_Seconds",
+        "join_limit": (
+            "same-host wall-clock alignment at turbostat sampling resolution; this join is not an "
+            "independent elapsed-time reference and can be affected by CLOCK_REALTIME adjustments"
+        ),
+    }
+    for metric in _TURBOSTAT_METRICS:
+        values = [sample["metrics"][metric] for sample in selected if metric in sample["metrics"]]
+        if values:
+            result["metrics"][metric] = _quantiles(values)
+    return result
+
+
+def analyze_turbostat_capture(
+    root: Path, campaign: dict[str, Any]
+) -> tuple[dict[str, Any] | None, dict[tuple[str, int, str], dict[str, Any]]]:
+    capture = campaign.get("turbostat_capture")
+    if not isinstance(capture, dict):
+        return None, {}
+    raw_path = _resolve_artifact(root, str(capture.get("output", "")))
+    cpu = int(capture.get("cpu", campaign.get("design", {}).get("timerlat_cpu", 7)))
+    samples, diagnostics = _parse_turbostat_rows(raw_path, cpu) if raw_path else ([], {
+        "header_rows": 0,
+        "malformed_rows": 0,
+        "cpu_rows": 0,
+    })
+    try:
+        raw_output_label = raw_path.relative_to(root).as_posix() if raw_path else capture.get("output")
+    except ValueError:
+        raw_output_label = str(raw_path)
+    result: dict[str, Any] = {
+        "capture_status": capture.get("status"),
+        "cpu": cpu,
+        "observer_process_state": capture.get("observer_process_state"),
+        "observer_process_state_at_stop": capture.get("observer_process_state_at_stop"),
+        "interval_seconds": capture.get("interval_seconds"),
+        "raw_output": raw_output_label,
+        "raw_output_sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest() if raw_path else None,
+        "raw_output_bytes": raw_path.stat().st_size if raw_path else None,
+        "parsed_cpu_sample_count": len(samples),
+        "parser_diagnostics": diagnostics,
+        "time_semantics": (
+            "Time_Of_Day_Seconds is a host wall-clock label used only to join CPU telemetry "
+            "to the probe's CLOCK_REALTIME start/end markers"
+        ),
+    }
+    summaries: dict[tuple[str, int, str], dict[str, Any]] = {}
+    for trial in campaign.get("trials", []):
+        window = _read_probe_realtime_window(root, trial)
+        summary = _summarize_turbostat_window(samples, window, cpu)
+        key = (str(trial.get("arm")), int(trial.get("replicate", 0)), str(trial.get("condition")))
+        summaries[key] = summary
+    return result, summaries
+
+
 def _probe_value(
     run: dict[str, Any], metric: str, probe_cpu: int, timerlat_cpu: int
 ) -> float | None:
@@ -107,11 +324,14 @@ def build_report(
     campaign: dict[str, Any],
     probe_summaries: dict[tuple[str, int, str], dict[str, Any]],
     timerlat_summaries: dict[tuple[str, int, str], dict[str, Any]],
+    turbostat_summary: dict[str, Any] | None = None,
+    turbostat_trial_summaries: dict[tuple[str, int, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     campaign_id = campaign["campaign_id"]
     design = campaign.get("design", {})
     probe_cpu = int(design.get("probe_cpu", 6))
     timerlat_cpu = int(design.get("timerlat_cpu", 7))
+    turbostat_trial_summaries = turbostat_trial_summaries or {}
     probe_values: dict[str, dict[tuple[str, int, str], float]] = {
         metric: {} for metric in _PROBE_METRICS
     }
@@ -127,7 +347,11 @@ def build_report(
         ("recovery", "recovery_minus_baseline"),
     )
     probe_map = probe_values["clockpressure_wakeup_p99"]
-    all_replicates = sorted({replicate for _, replicate, _ in probe_map})
+    all_replicates = sorted(
+        {replicate for _, replicate, _ in probe_map}
+        | {replicate for _, replicate, _ in timerlat_summaries}
+        | {replicate for _, replicate, _ in turbostat_trial_summaries}
+    )
     design = campaign.get("design", {})
     arms = tuple(design.get("arms") or ("timerlat_disabled", "timerlat_user"))
     configured_timerlat_arms = design.get("timerlat_arms")
@@ -139,7 +363,7 @@ def build_report(
 
     for arm_index, arm in enumerate(arms):
         for condition, label in contrast_specs:
-            metric_specs = list(_PROBE_METRICS.items())
+            metric_specs = [*list(_PROBE_METRICS.items()), *_TURBOSTAT_CONTRAST_METRICS]
             if arm in timerlat_arms:
                 metric_specs.extend((f"timerlat_{kind}_p99", "ns") for kind in _TIMERLAT_KINDS)
             for metric_name, unit in metric_specs:
@@ -151,6 +375,16 @@ def build_report(
                         after_summary = timerlat_summaries.get((arm, replicate, condition), {})
                         base = base_summary.get(kind, {}).get("p99")
                         after = after_summary.get(kind, {}).get("p99")
+                        if base is not None and after is not None:
+                            values.append(float(after) - float(base))
+                elif metric_name.startswith("turbostat_cpu_"):
+                    for replicate in all_replicates:
+                        base = _turbostat_median(
+                            turbostat_trial_summaries, (arm, replicate, "baseline"), metric_name
+                        )
+                        after = _turbostat_median(
+                            turbostat_trial_summaries, (arm, replicate, condition), metric_name
+                        )
                         if base is not None and after is not None:
                             values.append(float(after) - float(base))
                 else:
@@ -197,6 +431,7 @@ def build_report(
         intervention_arm = str(intervention.get("arm", "timerlat_user_pm_qos"))
         metric_specs = (
             *list(_PROBE_METRICS.items()),
+            *_TURBOSTAT_CONTRAST_METRICS,
             *((f"timerlat_{kind}_p99", "ns") for kind in _TIMERLAT_KINDS),
         )
         for condition in ("baseline", "cpu_pressure", "recovery"):
@@ -211,6 +446,17 @@ def build_report(
                         treated = timerlat_summaries.get((intervention_arm, replicate, condition), {}).get(
                             kind, {}
                         ).get("p99")
+                    elif metric_name.startswith("turbostat_cpu_"):
+                        default = _turbostat_median(
+                            turbostat_trial_summaries,
+                            (default_arm, replicate, condition),
+                            metric_name,
+                        )
+                        treated = _turbostat_median(
+                            turbostat_trial_summaries,
+                            (intervention_arm, replicate, condition),
+                            metric_name,
+                        )
                     else:
                         default = probe_values[metric_name].get((default_arm, replicate, condition))
                         treated = probe_values[metric_name].get((intervention_arm, replicate, condition))
@@ -249,6 +495,27 @@ def build_report(
                     default_pressure = timer_value(default_arm, "cpu_pressure")
                     treated_base = timer_value(intervention_arm, "baseline")
                     treated_pressure = timer_value(intervention_arm, "cpu_pressure")
+                elif metric_name.startswith("turbostat_cpu_"):
+                    default_base = _turbostat_median(
+                        turbostat_trial_summaries,
+                        (default_arm, replicate, "baseline"),
+                        metric_name,
+                    )
+                    default_pressure = _turbostat_median(
+                        turbostat_trial_summaries,
+                        (default_arm, replicate, "cpu_pressure"),
+                        metric_name,
+                    )
+                    treated_base = _turbostat_median(
+                        turbostat_trial_summaries,
+                        (intervention_arm, replicate, "baseline"),
+                        metric_name,
+                    )
+                    treated_pressure = _turbostat_median(
+                        turbostat_trial_summaries,
+                        (intervention_arm, replicate, "cpu_pressure"),
+                        metric_name,
+                    )
                 else:
                     value_map = probe_values[metric_name]
                     default_base = value_map.get((default_arm, replicate, "baseline"))
@@ -286,6 +553,7 @@ def build_report(
         condition = trial["condition"]
         run = probe_summaries.get((arm, replicate, condition), {})
         timer = timerlat_summaries.get((arm, replicate, condition), {}) if arm in timerlat_arms else {}
+        turbostat = turbostat_trial_summaries.get((arm, replicate, condition))
         probe_metrics = {
             metric: _probe_value(run, metric, probe_cpu, timerlat_cpu)
             for metric in _PROBE_METRICS
@@ -339,6 +607,8 @@ def build_report(
                 ) if arm in timerlat_arms else None,
                 "timerlat_user_worker": trial.get("timerlat_user_worker") if arm in timerlat_arms else None,
                 "cpu_dma_latency_request": trial.get("cpu_dma_latency_request"),
+                "cpu_idle_transition_analysis": trial.get("cpu_idle_transition_summary"),
+                "turbostat_cpu_telemetry": turbostat,
             }
         )
 
@@ -401,6 +671,7 @@ def build_report(
         "campaign_status_note": campaign.get("analysis_status_note"),
         "external_elapsed_time_reference": None,
         "clockrate_claim_allowed": False,
+        "turbostat_capture": turbostat_summary,
         "observer_effects": observer_effects,
         "intervention_effects": intervention_effects,
         "interaction_effects": interaction_effects,
@@ -413,6 +684,13 @@ def build_report(
             "CLOCK_MONOTONIC wake lateness measures timer delivery and execution delay, not elapsed-time rate error",
             "bootstrap intervals resample paired run summaries and do not account for calibration uncertainty or campaign-to-campaign variation",
             "no calibrated independent elapsed-time reference is acquired by this campaign",
+            *(
+                [
+                    "turbostat adds a periodic observer; its recorded CPU affinity and scheduling policy are part of the measurement condition"
+                ]
+                if turbostat_summary is not None
+                else []
+            ),
         ],
     }
 
@@ -455,6 +733,12 @@ def analyze_campaign(campaign_path: Path) -> dict[str, Any]:
                 probe_summaries[(arm, int(replicate), str(condition))] = run
 
     timerlat_summaries: dict[tuple[str, int, str], dict[str, Any]] = {}
+    idle_tracepoint = campaign.get("design", {}).get("cpu_idle_tracepoint")
+    idle_cpu = int(idle_tracepoint["cpu"]) if idle_tracepoint else None
+    idle_state_names = {
+        int(key): str(value)
+        for key, value in (idle_tracepoint.get("state_names", {}) if idle_tracepoint else {}).items()
+    }
     for trial in campaign.get("trials", []):
         arm = str(trial.get("arm"))
         if arm not in timerlat_arms:
@@ -482,9 +766,23 @@ def analyze_campaign(campaign_path: Path) -> dict[str, Any]:
             "duplicate_activation_events": parsed["duplicate_activation_event_count"],
             "malformed_latency_lines": parsed["malformed_latency_line_count"],
         }
+        if idle_cpu is not None:
+            idle_analysis = analyze_idle_transitions(
+                trace_path,
+                cpu=idle_cpu,
+                state_names=idle_state_names,
+            )
+            trial["cpu_idle_transition_summary"] = idle_analysis
         timerlat_summaries[key] = parsed["latency_ns"]
 
-    report = build_report(campaign, probe_summaries, timerlat_summaries)
+    turbostat_summary, turbostat_trial_summaries = analyze_turbostat_capture(root, campaign)
+    report = build_report(
+        campaign,
+        probe_summaries,
+        timerlat_summaries,
+        turbostat_summary,
+        turbostat_trial_summaries,
+    )
     (root / "timerlat-campaign-analysis.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n"
     )
@@ -547,6 +845,48 @@ def _markdown(report: dict[str, Any]) -> str:
             *report["interaction_effects"],
         ]
     ]
+    turbostat_rows = []
+    for trial in report["per_trial"]:
+        telemetry = trial.get("turbostat_cpu_telemetry")
+        if not telemetry:
+            continue
+        metrics = telemetry.get("metrics", {})
+        medians = {name: metrics.get(name, {}).get("median") for name in _TURBOSTAT_METRICS}
+        turbostat_rows.append(
+            "| {replicate} | {arm} | {condition} | {status} | {n} | {busy} | {mhz} | {c10} | {watt} | {temp} |".format(
+                replicate=trial["replicate"],
+                arm=trial["arm"],
+                condition=trial["condition"],
+                status=telemetry.get("status"),
+                n=telemetry.get("sample_count", 0),
+                busy=_format(medians["Busy%"]),
+                mhz=_format(medians["Bzy_MHz"]),
+                c10=_format(medians["C10%"]),
+                watt=_format(medians["PkgWatt"]),
+                temp=_format(medians["PkgTmp"]),
+            )
+        )
+    turbostat_section = []
+    if report.get("turbostat_capture"):
+        capture = report["turbostat_capture"]
+        turbostat_section = [
+            "## Turbostat CPU telemetry",
+            "",
+            f"Capture: `{capture.get('capture_status')}` on CPU {capture.get('cpu')}; "
+            f"{capture.get('parsed_cpu_sample_count', 0)} parsed CPU rows from `{capture.get('raw_output')}`.",
+            f"Sampler process state after the first sample: `{capture.get('observer_process_state')}`; "
+            f"at shutdown: `{capture.get('observer_process_state_at_stop')}`. "
+            "The recorded affinity is diagnostic; turbostat may migrate while reading per-CPU counters.",
+            "",
+            "Samples are joined to each probe's host CLOCK_REALTIME start/end markers. The 1-second (or configured) samples can straddle condition edges; wall-clock alignment is not an independent elapsed-time reference.",
+            "",
+            "| Replicate | Arm | Condition | Join | Samples | Busy% median | Bzy MHz median | C10% median | Package W median | Package °C median |",
+            "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            *turbostat_rows,
+            "",
+            "`Pkg%pc6` and `Pk%pc10` are retained in JSON when present; zero values do not establish that the corresponding package state was entered.",
+            "",
+        ]
     return "\n".join(
         [
             "# Timerlat controlled campaign analysis",
@@ -567,6 +907,7 @@ def _markdown(report: dict[str, Any]) -> str:
             "| --- | --- | --- | ---: | ---: | ---: |",
             *contrast_rows,
             "",
+            *turbostat_section,
             "## Interpretation limits",
             "",
             *[f"- {item}" for item in report["interpretation_limits"]],

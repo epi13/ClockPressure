@@ -187,6 +187,7 @@ def _tool_versions() -> dict[str, str | None]:
         "bpftrace": ["bpftrace", "--version"],
         "perf": ["perf", "version"],
         "pahole": ["pahole", "--version"],
+        "turbostat": ["turbostat", "--version"],
         "python3": ["python3", "--version"],
         "ethtool": ["ethtool", "--version"],
     }

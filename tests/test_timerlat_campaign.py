@@ -8,16 +8,123 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from analysis.analyze_timerlat_campaign import analyze_campaign, build_report
+from analysis.analyze_timerlat_campaign import (
+    analyze_campaign,
+    analyze_turbostat_capture,
+    build_report,
+    _markdown,
+)
 import experiments.run_timerlat_campaign as timerlat_runner
 from experiments.run_timerlat_campaign import (
     CpuDmaLatencyRequest,
+    TracefsTimerlat,
+    TurbostatSampler,
     _empty_trace,
+    _cpu_buffer_integrity,
+    _normalized_event_filter,
     _option_enabled,
 )
 
 
 class TestTimerlatCampaignAnalysis(unittest.TestCase):
+    def test_turbostat_capture_joins_cpu_samples_to_probe_realtime_window(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run = root / "runs" / "timerlat_user" / "run-1"
+            run.mkdir(parents=True)
+            (run / "probe.jsonl").write_text(
+                '\n'.join(
+                    json.dumps(record)
+                    for record in (
+                        {"kind": "start", "realtime_ns": 100_000_000_000},
+                        {"kind": "sample", "realtime_ns": 102_000_000_000},
+                        {"kind": "end", "realtime_ns": 104_000_000_000},
+                    )
+                )
+                + "\n"
+            )
+            header = "Time_Of_Day_Seconds\tCore\tCPU\tBusy%\tBzy_MHz\tC10%\tPkgTmp\tPkgWatt"
+            lines = [
+                header,
+                "99\t-\t-\t99\t9999\t0\t90\t100",
+                "99\t7\t7\t1\t1000\t90\t40\t4",
+                header,
+                "100\t7\t7\t2\t2000\t80\t41\t5",
+                header,
+                "101\t7\t7\t4\t3000\t70\t42\t6",
+                "103\t7\t7\t6\t4000\t60\t43\t7",
+                header,
+                "104\t7\t7\t8\t5000\t50\t44\t8",
+                "105\t7\t7\t99\t9999\t0\t90\t100",
+            ]
+            (root / "turbostat.tsv").write_text("\n".join(lines) + "\n")
+            campaign = {
+                "campaign_id": "turbostat-fixture",
+                "status": "complete",
+                "design": {"timerlat_cpu": 7, "arms": ["timerlat_user"]},
+                "turbostat_capture": {
+                    "status": "stopped",
+                    "cpu": 7,
+                    "interval_seconds": 1.0,
+                    "output": "turbostat.tsv",
+                    "observer_process_state": {"affinity_cpus": [7]},
+                    "observer_process_state_at_stop": {"affinity_cpus": [7]},
+                },
+                "trials": [
+                    {
+                        "arm": "timerlat_user",
+                        "replicate": 1,
+                        "condition": "baseline",
+                        "run_dir": "runs/timerlat_user/run-1",
+                    },
+                    {
+                        "arm": "timerlat_user",
+                        "replicate": 1,
+                        "condition": "cpu_pressure",
+                    },
+                ],
+            }
+
+            capture, summaries = analyze_turbostat_capture(root, campaign)
+
+        summary = summaries[("timerlat_user", 1, "baseline")]
+        self.assertEqual(capture["parsed_cpu_sample_count"], 6)
+        self.assertEqual(capture["parser_diagnostics"]["header_rows"], 4)
+        self.assertEqual(summary["status"], "aligned")
+        self.assertEqual(summary["sample_count"], 4)
+        self.assertEqual(summary["metrics"]["Busy%"]["median"], 5)
+        self.assertEqual(summary["metrics"]["PkgWatt"]["median"], 6.5)
+        self.assertIn("not an independent elapsed-time reference", summary["join_limit"])
+        pressure_summary = {
+            "status": "aligned",
+            "sample_count": 4,
+            "metrics": {"PkgTmp": {"median": 52.0}},
+        }
+        report = build_report(
+            campaign,
+            {},
+            {},
+            capture,
+            {**summaries, ("timerlat_user", 1, "cpu_pressure"): pressure_summary},
+        )
+        self.assertEqual(
+            report["per_trial"][0]["turbostat_cpu_telemetry"]["sample_count"],
+            4,
+        )
+        self.assertEqual(
+            report["turbostat_capture"]["observer_process_state"]["affinity_cpus"],
+            [7],
+        )
+        temp_contrast = next(
+            item
+            for item in report["paired_contrasts"]
+            if item["metric"] == "turbostat_cpu_PkgTmp_median"
+            and item["contrast"] == "pressure_minus_baseline"
+        )
+        self.assertEqual(temp_contrast["paired_difference"]["median"], 9.5)
+        self.assertIn("Turbostat CPU telemetry", _markdown(report))
+        self.assertIn("Sampler process state after the first sample", _markdown(report))
+
     def test_pairs_probe_and_timerlat_metrics_by_arm_and_replicate(self):
         campaign = {
             "campaign_id": "fixture-campaign",
@@ -135,6 +242,223 @@ class TestTimerlatCampaignAnalysis(unittest.TestCase):
 
 
 class TestTracefsHelpers(unittest.TestCase):
+    def test_turbostat_sampler_records_observed_process_state_without_relocating(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "turbostat.tsv"
+            fake_process = mock.Mock()
+            fake_process.pid = 4243
+            fake_process.poll.return_value = None
+            fake_process.wait.return_value = 130
+
+            def fake_popen(command, **_kwargs):
+                Path(command[command.index("--out") + 1]).write_text(
+                    "Time_Of_Day_Seconds\tCPU\n1793172000.0\t7\n"
+                )
+                return fake_process
+
+            sampler = TurbostatSampler(
+                output,
+                cpu=7,
+                interval_sec=0.5,
+            )
+            with (
+                mock.patch.object(timerlat_runner.shutil, "which", return_value="/usr/bin/turbostat"),
+                mock.patch.object(timerlat_runner.subprocess, "Popen", side_effect=fake_popen),
+                mock.patch.object(timerlat_runner.os, "killpg"),
+                mock.patch.object(timerlat_runner.os, "sched_setaffinity") as set_affinity,
+                mock.patch.object(
+                    timerlat_runner.os,
+                    "sched_getaffinity",
+                    side_effect=[{7}, {7}],
+                ),
+                mock.patch.object(timerlat_runner.os, "getpriority", return_value=-20),
+                mock.patch.object(
+                    timerlat_runner.os,
+                    "sched_getscheduler",
+                    return_value=timerlat_runner.os.SCHED_OTHER,
+                ),
+                mock.patch.object(
+                    timerlat_runner.os,
+                    "sched_getparam",
+                    return_value=mock.Mock(sched_priority=0),
+                ),
+            ):
+                sampler.start()
+                record = sampler.stop()
+
+        set_affinity.assert_not_called()
+        self.assertEqual(record["observer_process_state"]["affinity_cpus"], [7])
+        self.assertEqual(record["observer_process_state_at_stop"]["affinity_cpus"], [7])
+        self.assertEqual(record["observer_process_state"]["nice"], -20)
+        self.assertEqual(record["observer_process_state"]["scheduler_policy"], "SCHED_OTHER")
+
+    def test_turbostat_sampler_waits_for_timestamped_data_and_stops_cleanly(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "turbostat.tsv"
+            fake_process = mock.Mock()
+            fake_process.pid = 4242
+            fake_process.poll.return_value = None
+            fake_process.wait.return_value = 130
+
+            def fake_popen(command, **_kwargs):
+                sample_path = Path(command[command.index("--out") + 1])
+                sample_path.write_text(
+                    "Time_Of_Day_Seconds\tCPU\n1793172000.0\t7\n"
+                )
+                return fake_process
+
+            sampler = TurbostatSampler(output, cpu=7, interval_sec=0.5)
+            with (
+                mock.patch.object(timerlat_runner.shutil, "which", return_value="/usr/bin/turbostat"),
+                mock.patch.object(timerlat_runner.subprocess, "Popen", side_effect=fake_popen) as popen,
+                mock.patch.object(timerlat_runner.os, "killpg") as killpg,
+            ):
+                sampler.start()
+                record = sampler.stop()
+            output_bytes = output.stat().st_size
+            output_mode = output.stat().st_mode & 0o777
+
+        command = popen.call_args.args[0]
+        self.assertIn("0.5", command)
+        self.assertEqual(command[command.index("--cpu") + 1], "7")
+        self.assertEqual(record["returncode"], 130)
+        self.assertEqual(record["output_bytes"], output_bytes)
+        self.assertEqual(output_mode, 0o600)
+        killpg.assert_called_once_with(4242, timerlat_runner.signal.SIGINT)
+
+    def test_cpu_buffer_integrity_parses_loss_counters(self):
+        self.assertEqual(
+            _cpu_buffer_integrity(
+                "entries: 100\noverrun: 4\ncommit overrun: 1\ndropped events: 2\n"
+            ),
+            {"overrun": 4, "commit_overrun": 1, "dropped_events": 2},
+        )
+        self.assertEqual(
+            _cpu_buffer_integrity("entries: 100\noverrun: 0\ndropped events: 0\n"),
+            {"overrun": 0, "commit_overrun": None, "dropped_events": 0},
+        )
+
+    def test_normalizes_stale_tracefs_filter_diagnostics(self):
+        self.assertEqual(
+            _normalized_event_filter("none\n ^\nparse_error: Field not found: cpu_id\n"),
+            "none",
+        )
+        self.assertEqual(
+            _normalized_event_filter("cpu_id == 7\n ^\nparse_error: stale\n"),
+            "cpu_id == 7",
+        )
+        self.assertIsNone(_normalized_event_filter(None))
+
+    def test_cpu_idle_tracepoint_filter_is_enabled_and_restored(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            files = {
+                "current_tracer": "nop\n",
+                "tracing_on": "1\n",
+                "buffer_size_kb": "7\n",
+                "trace_clock": "local global counter\n",
+                "available_tracers": "nop timerlat\n",
+                "set_event": "\n",
+                "trace": "# entries-in-buffer/entries-written: 0/0 #P:8\n",
+                "osnoise/options": "NO_OSNOISE_WORKLOAD\n",
+                "osnoise/cpus": "0-7\n",
+                "osnoise/timerlat_period_us": "1000\n",
+                "events/power/cpu_idle/enable": "0\n",
+                "events/power/cpu_idle/filter": "none\n",
+                "osnoise/per_cpu/cpu7/timerlat_fd": "",
+                "per_cpu/cpu7/stats": "entries: 0\noverrun: 0\n",
+            }
+            for relative, value in files.items():
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(value)
+
+            before = {
+                "current_tracer": "nop",
+                "tracing_on": "1",
+                "buffer_size_kb": "7",
+                "trace_clock": "local global counter",
+                "timerlat_period_us": "1000",
+                "osnoise_cpus": "0-7",
+                "osnoise_workload_enabled": False,
+                "osnoise_options_raw": "NO_OSNOISE_WORKLOAD",
+                "enabled_events": "",
+                "cpu_idle_event_enabled": "0",
+                "cpu_idle_event_filter": "none",
+                "trace_empty": True,
+            }
+            with mock.patch.object(
+                TracefsTimerlat,
+                "_settings",
+                side_effect=[before, before.copy()],
+            ):
+                tracefs = TracefsTimerlat(root, 7, 10000, 64, cpu_idle_cpu=7)
+                tracefs.start()
+                self.assertEqual((root / "events/power/cpu_idle/enable").read_text().strip(), "1")
+                self.assertEqual(
+                    (root / "events/power/cpu_idle/filter").read_text().strip(),
+                    "cpu_id == 7",
+                )
+                result = tracefs.stop_and_restore()
+
+            self.assertTrue(result["restored"])
+            self.assertEqual((root / "events/power/cpu_idle/enable").read_text().strip(), "0")
+            self.assertEqual((root / "events/power/cpu_idle/filter").read_text().strip(), "0")
+            self.assertEqual((root / "current_tracer").read_text().strip(), "nop")
+            self.assertEqual((root / "tracing_on").read_text().strip(), "1")
+
+    def test_restore_error_names_path_and_keeps_collected_trace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            files = {
+                "current_tracer": "nop\n",
+                "tracing_on": "1\n",
+                "buffer_size_kb": "7\n",
+                "trace_clock": "local global counter\n",
+                "available_tracers": "nop timerlat\n",
+                "set_event": "\n",
+                "trace": "# entries-in-buffer/entries-written: 0/0 #P:8\n",
+                "osnoise/options": "NO_OSNOISE_WORKLOAD\n",
+                "osnoise/cpus": "0-7\n",
+                "osnoise/timerlat_period_us": "1000\n",
+                "events/power/cpu_idle/enable": "0\n",
+                "events/power/cpu_idle/filter": "none\n",
+                "osnoise/per_cpu/cpu7/timerlat_fd": "",
+                "per_cpu/cpu7/stats": "entries: 0\noverrun: 0\n",
+            }
+            for relative, value in files.items():
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(value)
+
+            tracefs = TracefsTimerlat(root, 7, 10000, 64, cpu_idle_cpu=7)
+            tracefs.changed = True
+            (root / "current_tracer").write_text("timerlat\n")
+            (root / "tracing_on").write_text("1\n")
+            (root / "events/power/cpu_idle/enable").write_text("1\n")
+            (root / "events/power/cpu_idle/filter").write_text("cpu_id == 7\n")
+            (root / "trace").write_text("captured trace evidence\n")
+
+            real_write = timerlat_runner._write
+
+            def fail_filter_reset(path, value):
+                if path == root / "events/power/cpu_idle/filter" and value == "0":
+                    raise OSError(22, "invalid argument")
+                if path == root / "trace" and value == "":
+                    path.write_text("# entries-in-buffer/entries-written: 0/0 #P:8\n")
+                    return
+                real_write(path, value)
+
+            with mock.patch.object(timerlat_runner, "_write", side_effect=fail_filter_reset):
+                result = tracefs.stop_and_restore()
+
+        self.assertEqual(result["trace"], "captured trace evidence\n")
+        self.assertFalse(result["restored"])
+        self.assertTrue(
+            any("events/power/cpu_idle/filter" in error and "invalid argument" in error
+                for error in result["errors"])
+        )
+
     def test_trace_empty_requires_zero_entries_written(self):
         self.assertTrue(_empty_trace("# entries-in-buffer/entries-written: 0/0 #P:8\n"))
         self.assertFalse(_empty_trace("# entries-in-buffer/entries-written: 0/4 #P:8\n"))
@@ -192,6 +516,57 @@ class TestTracefsHelpers(unittest.TestCase):
             self.assertEqual(result["timerlat_buffer_stats"]["overrun"], 0)
             self.assertEqual(report["timerlat_integrity"]["trace_buffer_dropped_events"], 0)
             self.assertEqual(report["timerlat_integrity"]["user_return_activations"], 1)
+
+    def test_campaign_analysis_joins_cpu_idle_state_to_timerlat_irq(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            trace_dir = root / "timerlat" / "timerlat_user"
+            trace_dir.mkdir(parents=True)
+            trace = trace_dir / "sample.trace"
+            trace.write_text(
+                "swapper/7-0 [007] .... 1.000000: cpu_idle: state=8 cpu_id=7\n"
+                "<idle>-0 [007] d.h1. 1.000100: #1 context irq timer_latency 30000 ns\n"
+                "<...>-12 [007] ....1 1.000110: #1 context thread timer_latency 31000 ns\n"
+                "<...>-12 [007] ....1 1.000120: #1 context user-ret timer_latency 32000 ns\n"
+                "swapper/7-0 [007] .... 1.000200: cpu_idle: state=4294967295 cpu_id=7\n"
+            )
+            campaign_path = root / "campaign.json"
+            campaign_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "clockpressure.timerlat-campaign.v1",
+                        "campaign_id": "idle-transition-fixture",
+                        "status": "complete",
+                        "design": {
+                            "arms": ["timerlat_user"],
+                            "timerlat_arms": ["timerlat_user"],
+                            "cpu_idle_tracepoint": {
+                                "event": "power:cpu_idle",
+                                "cpu": 7,
+                                "state_names": {"8": "C10"},
+                            },
+                        },
+                        "trials": [
+                            {
+                                "arm": "timerlat_user",
+                                "condition": "baseline",
+                                "replicate": 1,
+                                "status": "complete",
+                                "timerlat_trace": "timerlat/timerlat_user/sample.trace",
+                                "timerlat_trace_sha256": hashlib.sha256(trace.read_bytes()).hexdigest(),
+                            }
+                        ],
+                    }
+                )
+            )
+
+            report = analyze_campaign(campaign_path)
+
+        idle = report["per_trial"][0]["cpu_idle_transition_analysis"]
+        self.assertEqual(idle["timerlat_irq_events"], 1)
+        self.assertEqual(idle["matched_idle_state_activations"], 1)
+        self.assertEqual(idle["per_state"][0]["state_name"], "C10")
+        self.assertEqual(idle["per_state"][0]["timerlat_irq_latency_ns"]["p99"], 30000)
 
     def test_analyzer_flags_complete_manifest_with_failed_trial(self):
         with tempfile.TemporaryDirectory() as temporary:

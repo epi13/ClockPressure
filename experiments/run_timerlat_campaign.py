@@ -9,6 +9,7 @@ import os
 import random
 import re
 import signal
+import shutil
 import struct
 import subprocess
 import sys
@@ -23,6 +24,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from analysis.analyze_timerlat import analyze_trace
+from analysis.analyze_idle_transitions import (
+    POST_EXIT_MATCH_LOOKBACK_NS,
+    analyze_idle_transitions,
+)
 from experiments.environment import snapshot_environment
 from experiments.run_trial import _parse_cpus, _write_json
 
@@ -60,6 +65,38 @@ def _empty_trace(trace: str) -> bool:
     return bool(match and match.group(1) == "0" and match.group(2) == "0")
 
 
+def _cpu_buffer_integrity(stats: str) -> dict[str, int | None]:
+    parsed: dict[str, int | None] = {
+        "overrun": None,
+        "commit_overrun": None,
+        "dropped_events": None,
+    }
+    labels = {
+        "overrun": "overrun",
+        "commit overrun": "commit_overrun",
+        "dropped events": "dropped_events",
+    }
+    for line in stats.splitlines():
+        key, separator, value = line.partition(":")
+        if not separator or key.strip() not in labels:
+            continue
+        try:
+            parsed[labels[key.strip()]] = int(value.strip())
+        except ValueError:
+            continue
+    return parsed
+
+
+def _normalized_event_filter(raw_filter: str | None) -> str | None:
+    """Return the active filter expression, excluding tracefs diagnostics."""
+    if raw_filter is None:
+        return None
+    first_line = raw_filter.splitlines()[0].strip() if raw_filter.splitlines() else ""
+    if first_line in ("", "none", "0"):
+        return "none"
+    return first_line
+
+
 def _option_enabled(options: str, option: str) -> bool:
     words = set(options.split())
     if f"NO_{option}" in words:
@@ -67,29 +104,202 @@ def _option_enabled(options: str, option: str) -> bool:
     return option in words
 
 
+_TURBOSTAT_FIELDS = (
+    "Time_Of_Day_Seconds,CPU,Core,Busy%,Bzy_MHz,C10%,"
+    "Pkg%pc6,Pk%pc10,PkgWatt,PkgTmp"
+)
+
+
+class TurbostatSampler:
+    """Capture package and selected-CPU counters while a campaign runs."""
+
+    def __init__(
+        self,
+        output_path: Path,
+        *,
+        cpu: int,
+        interval_sec: float,
+    ):
+        self.output_path = output_path
+        self.stderr_path = output_path.with_suffix(".stderr")
+        self.cpu = cpu
+        self.interval_sec = interval_sec
+        self.binary: str | None = None
+        self.process: subprocess.Popen[bytes] | None = None
+        self.stderr_stream = None
+        self.started_at_utc: str | None = None
+        self.stopped_at_utc: str | None = None
+        self.observer_process_state: dict[str, Any] | None = None
+
+    def _process_state(self) -> dict[str, Any]:
+        if self.process is None:
+            return {"available": False, "reason": "process was not started"}
+        pid = self.process.pid
+        try:
+            affinity = sorted(os.sched_getaffinity(pid))
+            nice = os.getpriority(os.PRIO_PROCESS, pid)
+            policy = os.sched_getscheduler(pid)
+            priority = os.sched_getparam(pid).sched_priority
+        except OSError as exc:
+            return {
+                "available": False,
+                "pid": pid,
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+        policy_names = {
+            os.SCHED_OTHER: "SCHED_OTHER",
+            os.SCHED_FIFO: "SCHED_FIFO",
+            os.SCHED_RR: "SCHED_RR",
+        }
+        return {
+            "available": True,
+            "pid": pid,
+            "affinity_cpus": affinity,
+            "nice": nice,
+            "scheduler_policy": policy_names.get(policy, str(policy)),
+            "scheduler_priority": priority,
+        }
+
+    def _has_sample(self) -> bool:
+        try:
+            lines = self.output_path.read_text(errors="replace").splitlines()
+        except OSError:
+            return False
+        for line in lines:
+            first, separator, _rest = line.partition("\t")
+            if separator:
+                try:
+                    float(first)
+                    return True
+                except ValueError:
+                    continue
+        return False
+
+    def start(self) -> None:
+        self.binary = shutil.which("turbostat")
+        if self.binary is None:
+            raise RuntimeError("turbostat capture requested but turbostat is unavailable")
+        self.stderr_stream = self.stderr_path.open("wb")
+        command = [
+            self.binary,
+            "--quiet",
+            "--interval",
+            str(self.interval_sec),
+            "--cpu",
+            str(self.cpu),
+            "--show",
+            _TURBOSTAT_FIELDS,
+            "--out",
+            str(self.output_path),
+        ]
+        self.started_at_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        self.process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=self.stderr_stream,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                raise RuntimeError(
+                    f"turbostat exited before producing a sample (return code={self.process.returncode})"
+                )
+            if self._has_sample():
+                self.observer_process_state = self._process_state()
+                return
+            time.sleep(0.1)
+        raise RuntimeError("turbostat did not produce a timestamped sample within 10 seconds")
+
+    def stop(self) -> dict[str, Any]:
+        return_code: int | None = None
+        observer_process_state_at_stop = self._process_state()
+        if self.process is not None:
+            if self.process.poll() is None:
+                try:
+                    os.killpg(self.process.pid, signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+            try:
+                return_code = self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(self.process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    return_code = self.process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(self.process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    return_code = self.process.wait(timeout=2)
+        if self.stderr_stream is not None:
+            self.stderr_stream.close()
+            self.stderr_stream = None
+        if self.output_path.exists():
+            os.chmod(self.output_path, 0o600)
+        if self.stderr_path.exists():
+            os.chmod(self.stderr_path, 0o600)
+        self.stopped_at_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        return {
+            "binary": self.binary,
+            "cpu": self.cpu,
+            "interval_seconds": self.interval_sec,
+            "fields": _TURBOSTAT_FIELDS.split(","),
+            "clock_domain": "Time_Of_Day_Seconds for alignment only; not an independent elapsed-time reference",
+            "output": self.output_path.name,
+            "stderr": self.stderr_path.name,
+            "started_at_utc": self.started_at_utc,
+            "stopped_at_utc": self.stopped_at_utc,
+            "returncode": return_code,
+            "expected_stop_returncodes": [0, -signal.SIGINT, 128 + signal.SIGINT],
+            "output_bytes": self.output_path.stat().st_size if self.output_path.exists() else 0,
+            "observer_process_state": self.observer_process_state or self._process_state(),
+            "observer_process_state_at_stop": observer_process_state_at_stop,
+        }
+
+
 class TracefsTimerlat:
     """Manage the global timerlat tracer and restore its previously idle state."""
 
-    def __init__(self, tracefs: Path, cpu: int, period_us: int, buffer_kb: int):
+    def __init__(
+        self,
+        tracefs: Path,
+        cpu: int,
+        period_us: int,
+        buffer_kb: int,
+        cpu_idle_cpu: int | None = None,
+    ):
         self.tracefs = tracefs
         self.cpu = cpu
         self.period_us = period_us
         self.buffer_kb = buffer_kb
+        self.cpu_idle_cpu = cpu_idle_cpu
         self.changed = False
         self.before = self._settings()
         self._check_idle_state()
 
     def _settings(self) -> dict[str, Any]:
         options = _read(self.tracefs / "osnoise/options")
+        idle_event = self.tracefs / "events/power/cpu_idle"
+        trace_clock_path = self.tracefs / "trace_clock"
+        idle_filter_raw = _read(idle_event / "filter") if (idle_event / "filter").exists() else None
         return {
             "current_tracer": _read(self.tracefs / "current_tracer"),
             "tracing_on": _read(self.tracefs / "tracing_on"),
             "buffer_size_kb": _read(self.tracefs / "buffer_size_kb"),
+            "trace_clock": _read(trace_clock_path) if trace_clock_path.exists() else None,
             "timerlat_period_us": _read(self.tracefs / "osnoise/timerlat_period_us"),
             "osnoise_cpus": _read(self.tracefs / "osnoise/cpus"),
             "osnoise_workload_enabled": _option_enabled(options, "OSNOISE_WORKLOAD"),
             "osnoise_options_raw": options,
             "enabled_events": _read(self.tracefs / "set_event"),
+            "cpu_idle_event_enabled": _read(idle_event / "enable") if (idle_event / "enable").exists() else None,
+            "cpu_idle_event_filter": _normalized_event_filter(idle_filter_raw),
+            "cpu_idle_event_filter_raw": idle_filter_raw,
             "trace_empty": _empty_trace((self.tracefs / "trace").read_text(errors="replace")),
         }
 
@@ -102,6 +312,11 @@ class TracefsTimerlat:
             raise RuntimeError("tracefs has enabled events; refusing to disturb another trace")
         if not settings["trace_empty"]:
             raise RuntimeError("tracefs buffer has retained events; refusing to clear them")
+        if self.cpu_idle_cpu is not None and (
+            settings["cpu_idle_event_enabled"] is None
+            or settings["cpu_idle_event_filter"] is None
+        ):
+            raise RuntimeError("the active tracefs does not expose the power:cpu_idle tracepoint")
         available = set(_read(self.tracefs / "available_tracers").split())
         if "timerlat" not in available:
             raise RuntimeError("the active tracefs does not expose the timerlat tracer")
@@ -113,6 +328,12 @@ class TracefsTimerlat:
         _write(self.tracefs / "buffer_size_kb", str(self.buffer_kb))
         _write(self.tracefs / "osnoise/cpus", str(self.cpu))
         _write(self.tracefs / "osnoise/timerlat_period_us", str(self.period_us))
+        if self.cpu_idle_cpu is not None:
+            idle_event = self.tracefs / "events/power/cpu_idle"
+            _write(idle_event / "filter", f"cpu_id == {self.cpu_idle_cpu}")
+            _write(idle_event / "enable", "1")
+            if _read(idle_event / "enable") != "1":
+                raise RuntimeError("the power:cpu_idle tracepoint did not become enabled")
         if self.before["osnoise_workload_enabled"]:
             _write(self.tracefs / "osnoise/options", "NO_OSNOISE_WORKLOAD")
         _write(self.tracefs / "current_tracer", "timerlat")
@@ -128,72 +349,95 @@ class TracefsTimerlat:
 
         trace = ""
         cpu_stats = ""
-        errors: list[Exception] = []
+        errors: list[str] = []
         try:
             _write(self.tracefs / "tracing_on", "0")
-            trace = (self.tracefs / "trace").read_text(errors="replace")
-            stats_path = self.tracefs / f"per_cpu/cpu{self.cpu}/stats"
-            if stats_path.exists():
-                cpu_stats = stats_path.read_text(errors="replace")
         except Exception as exc:  # restoration still takes priority over collection
-            errors.append(exc)
-        finally:
-            restore_actions = [
-                (self.tracefs / "current_tracer", "nop"),
-                (self.tracefs / "trace", ""),
-                (self.tracefs / "osnoise/timerlat_period_us", self.before["timerlat_period_us"]),
-                (self.tracefs / "osnoise/cpus", self.before["osnoise_cpus"]),
-                (self.tracefs / "buffer_size_kb", self.before["buffer_size_kb"]),
-            ]
-            for path, value in restore_actions:
-                try:
-                    _write(path, value)
-                except Exception as exc:
-                    errors.append(exc)
+            errors.append(f"write {self.tracefs / 'tracing_on'}: {type(exc).__name__}: {exc}")
+        try:
+            trace = (self.tracefs / "trace").read_text(errors="replace")
+        except Exception as exc:
+            errors.append(f"read {self.tracefs / 'trace'}: {type(exc).__name__}: {exc}")
+        stats_path = self.tracefs / f"per_cpu/cpu{self.cpu}/stats"
+        if stats_path.exists():
             try:
-                current_options = _read(self.tracefs / "osnoise/options")
-                current_enabled = _option_enabled(current_options, "OSNOISE_WORKLOAD")
-                if current_enabled != self.before["osnoise_workload_enabled"]:
-                    toggle = (
-                        "OSNOISE_WORKLOAD"
-                        if self.before["osnoise_workload_enabled"]
-                        else "NO_OSNOISE_WORKLOAD"
-                    )
-                    _write(self.tracefs / "osnoise/options", toggle)
+                cpu_stats = stats_path.read_text(errors="replace")
             except Exception as exc:
-                errors.append(exc)
+                errors.append(f"read {stats_path}: {type(exc).__name__}: {exc}")
+        if self.cpu_idle_cpu is not None:
+            idle_event = self.tracefs / "events/power/cpu_idle"
+            saved_filter = self.before["cpu_idle_event_filter"]
+            filter_reset = "0" if saved_filter in (None, "none", "") else saved_filter
             for path, value in (
-                (self.tracefs / "current_tracer", self.before["current_tracer"]),
-                (self.tracefs / "tracing_on", self.before["tracing_on"]),
+                (idle_event / "enable", self.before["cpu_idle_event_enabled"] or "0"),
+                (idle_event / "filter", filter_reset),
             ):
                 try:
                     _write(path, value)
                 except Exception as exc:
-                    errors.append(exc)
-            self.changed = False
+                    errors.append(f"write {path}: {type(exc).__name__}: {exc}")
+        restore_actions = [
+            (self.tracefs / "current_tracer", "nop"),
+            (self.tracefs / "trace", ""),
+            (self.tracefs / "osnoise/timerlat_period_us", self.before["timerlat_period_us"]),
+            (self.tracefs / "osnoise/cpus", self.before["osnoise_cpus"]),
+            (self.tracefs / "buffer_size_kb", self.before["buffer_size_kb"]),
+        ]
+        for path, value in restore_actions:
+            try:
+                _write(path, value)
+            except Exception as exc:
+                errors.append(f"write {path}: {type(exc).__name__}: {exc}")
+        try:
+            current_options = _read(self.tracefs / "osnoise/options")
+            current_enabled = _option_enabled(current_options, "OSNOISE_WORKLOAD")
+            if current_enabled != self.before["osnoise_workload_enabled"]:
+                toggle = (
+                    "OSNOISE_WORKLOAD"
+                    if self.before["osnoise_workload_enabled"]
+                    else "NO_OSNOISE_WORKLOAD"
+                )
+                _write(self.tracefs / "osnoise/options", toggle)
+        except Exception as exc:
+            errors.append(
+                f"read/write {self.tracefs / 'osnoise/options'}: {type(exc).__name__}: {exc}"
+            )
+        for path, value in (
+            (self.tracefs / "current_tracer", self.before["current_tracer"]),
+            (self.tracefs / "tracing_on", self.before["tracing_on"]),
+        ):
+            try:
+                _write(path, value)
+            except Exception as exc:
+                errors.append(f"write {path}: {type(exc).__name__}: {exc}")
+        self.changed = False
 
-        after = self._settings()
-        restored = all(
-            after[key] == self.before[key]
+        after: dict[str, Any] = {}
+        try:
+            after = self._settings()
+        except Exception as exc:
+            errors.append(f"snapshot after restoration: {type(exc).__name__}: {exc}")
+        restored = bool(after) and all(
+            after.get(key) == self.before[key]
             for key in (
                 "current_tracer",
                 "tracing_on",
                 "buffer_size_kb",
+                "trace_clock",
                 "timerlat_period_us",
                 "osnoise_cpus",
                 "osnoise_workload_enabled",
                 "enabled_events",
+                "cpu_idle_event_enabled",
+                "cpu_idle_event_filter",
                 "trace_empty",
             )
         )
-        if errors:
-            raise RuntimeError(f"tracefs collection or restoration failed: {errors[0]}") from errors[0]
-        if not restored:
-            raise RuntimeError(f"tracefs state was not restored: before={self.before}, after={after}")
         return {
             "before": self.before,
             "after": after,
             "restored": restored,
+            "errors": errors,
             "cpu_buffer_stats": cpu_stats,
             "trace": trace,
         }
@@ -274,6 +518,22 @@ def _parse_cpus_arg(value: str) -> list[int]:
     except argparse.ArgumentTypeError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
     return cpus
+
+
+def _cpuidle_state_names(cpu: int) -> dict[str, str]:
+    state_root = Path(f"/sys/devices/system/cpu/cpu{cpu}/cpuidle")
+    names = {}
+    states = sorted(
+        state_root.glob("state*"),
+        key=lambda path: int(path.name.removeprefix("state")),
+    )
+    for state in states:
+        name_path = state / "name"
+        if name_path.is_file():
+            names[state.name.removeprefix("state")] = _read(name_path)
+    if not names:
+        raise RuntimeError(f"no named cpuidle states are available for CPU {cpu}")
+    return names
 
 
 def _trial_command(
@@ -418,7 +678,13 @@ def _run_trial(
 
     if timerlat_enabled:
         trace_session = TracefsTimerlat(
-            Path(args.tracefs_root), args.timerlat_cpu, args.period_us, args.buffer_kb
+            Path(args.tracefs_root),
+            args.timerlat_cpu,
+            args.period_us,
+            args.buffer_kb,
+            cpu_idle_cpu=(
+                args.timerlat_cpu if getattr(args, "capture_cpu_idle", False) else None
+            ),
         )
     qos_requested_value = _qos_requested_value(args, arm)
     if qos_requested_value is not None:
@@ -489,6 +755,13 @@ def _run_trial(
         if trace_session is not None:
             try:
                 trace_record = trace_session.stop_and_restore()
+                if trace_record.get("errors"):
+                    error = error or f"tracefs collection or restoration failed: {trace_record['errors'][0]}"
+                elif not trace_record.get("restored"):
+                    error = error or (
+                        "tracefs settings were not restored to their prior state: "
+                        f"before={trace_record.get('before')}, after={trace_record.get('after')}"
+                    )
             except Exception as exc:
                 error = error or f"tracefs restore: {type(exc).__name__}: {exc}"
         if qos_request is not None:
@@ -555,22 +828,65 @@ def _run_trial(
                 "duplicate_activation_events": analysis["duplicate_activation_event_count"],
                 "malformed_latency_lines": analysis["malformed_latency_line_count"],
             }
+            buffer_integrity = _cpu_buffer_integrity(
+                trace_record.get("cpu_buffer_stats", "")
+            )
+            entry["timerlat_buffer_integrity"] = buffer_integrity
+            buffer_losses = {
+                name: value
+                for name, value in buffer_integrity.items()
+                if value not in (None, 0)
+            }
+            if buffer_losses:
+                entry["error"] = (
+                    "timerlat trace buffer lost events: "
+                    + ", ".join(f"{name}={value}" for name, value in buffer_losses.items())
+                    + "; increase --buffer-kb or reduce trace-event volume"
+                )
+                entry["status"] = "failed"
+            if getattr(args, "capture_cpu_idle", False):
+                state_names = {
+                    int(key): value
+                    for key, value in _cpuidle_state_names(args.timerlat_cpu).items()
+                }
+                idle_analysis = analyze_idle_transitions(
+                    trace_path,
+                    cpu=args.timerlat_cpu,
+                    state_names=state_names,
+                )
+                idle_analysis_path = timerlat_dir / f"{run_id}.idle-analysis.json"
+                _write_json(idle_analysis_path, idle_analysis)
+                entry["cpu_idle_transition_analysis"] = _relative_artifact(
+                    idle_analysis_path, out
+                )
+                entry["cpu_idle_transition_summary"] = idle_analysis
+                if idle_analysis["cpu_idle_events"] == 0:
+                    entry["error"] = entry.get("error") or (
+                        "power:cpu_idle capture produced no events"
+                    )
+                    entry["status"] = "failed"
             entry["tracefs_restoration"] = {
                 key: value for key, value in trace_record.items() if key != "trace"
             }
             if not analysis["matched_irq_thread_activation_count"]:
-                entry["error"] = "timerlat trace retained no matched IRQ/thread activation"
+                entry["error"] = entry.get("error") or (
+                    "timerlat trace retained no matched IRQ/thread activation"
+                )
                 entry["status"] = "failed"
             if not trace_record.get("restored"):
-                entry["error"] = "tracefs settings were not restored to their prior state"
+                entry["error"] = entry.get("error") or (
+                    "tracefs settings were not restored to their prior state"
+                )
                 entry["status"] = "failed"
     if qos_record is not None:
         entry["cpu_dma_latency_request"] = qos_record
         if not qos_record.get("restored"):
-            entry["error"] = "CPU latency QoS did not return to its prior effective value"
+            entry["error"] = entry.get("error") or (
+                "CPU latency QoS did not return to its prior effective value"
+            )
             entry["status"] = "failed"
     if error:
-        entry["error"] = error
+        entry["error"] = entry.get("error") or error
         entry["status"] = "failed"
     if trial_returncode not in (0, None):
         entry["error"] = entry.get("error") or f"ClockPressure trial exited {trial_returncode}"
@@ -597,6 +913,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timerlat-cpu", type=int, default=7)
     parser.add_argument("--fifo-priority", type=int, default=90)
     parser.add_argument("--buffer-kb", type=int, default=2048)
+    parser.add_argument(
+        "--capture-cpu-idle",
+        action="store_true",
+        help="record power:cpu_idle transitions on the selected timerlat CPU",
+    )
+    parser.add_argument(
+        "--capture-turbostat",
+        action="store_true",
+        help="sample selected-CPU/package residency, frequency, power, and temperature during the campaign",
+    )
+    parser.add_argument("--turbostat-cpu", type=int)
+    parser.add_argument("--turbostat-interval-sec", type=float, default=1.0)
     parser.add_argument("--warmup-sec", type=float, default=5)
     parser.add_argument("--recovery-seconds", type=int, default=5)
     parser.add_argument(
@@ -620,6 +948,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_campaign(args: argparse.Namespace) -> Path:
+    args.capture_turbostat = getattr(args, "capture_turbostat", False)
+    args.turbostat_cpu = getattr(args, "turbostat_cpu", None)
+    args.turbostat_interval_sec = getattr(args, "turbostat_interval_sec", 1.0)
     if os.geteuid() != 0:
         raise RuntimeError("tracefs timerlat collection requires root; run under sudo")
     if not 1 <= args.duration_sec <= 3600:
@@ -640,6 +971,8 @@ def run_campaign(args: argparse.Namespace) -> Path:
         raise ValueError("--intertrial-cooldown-sec must be in 0..600")
     if args.warmup_sec < 0 or args.warmup_sec > 30:
         raise ValueError("--warmup-sec must be in 0..30")
+    if not 0.1 <= args.turbostat_interval_sec <= 60:
+        raise ValueError("--turbostat-interval-sec must be in 0.1..60")
     if not 1 <= args.fifo_priority <= 99:
         raise ValueError("--fifo-priority must be in 1..99")
     if not 0 <= args.dma_latency_us <= 2_000_000_000:
@@ -656,6 +989,9 @@ def run_campaign(args: argparse.Namespace) -> Path:
     requested_cpus = set(args.load_cpus) | {args.probe_cpu, args.timerlat_cpu}
     if not requested_cpus.issubset(online_cpus):
         raise ValueError(f"requested CPUs {sorted(requested_cpus)} must be online in {sorted(online_cpus)}")
+    turbostat_cpu = args.turbostat_cpu if args.turbostat_cpu is not None else args.timerlat_cpu
+    if args.capture_turbostat and turbostat_cpu not in online_cpus:
+        raise ValueError(f"turbostat CPU {turbostat_cpu} must be online")
     if not TRIAL.is_file() or not TIMERLAT_WORKER.is_file():
         raise RuntimeError("ClockPressure trial or timerlat user worker is missing")
     if not (ROOT / "build" / "clockpressure-probe").is_file():
@@ -675,6 +1011,16 @@ def run_campaign(args: argparse.Namespace) -> Path:
                 "one or more CPU latency QoS requests would not change the effective setting: "
                 f"current={qos_initial_effective_us} us, targets={qos_targets} us"
             )
+
+    capture_cpu_idle = getattr(args, "capture_cpu_idle", False)
+    cpu_idle_state_names = _cpuidle_state_names(args.timerlat_cpu) if capture_cpu_idle else None
+    initial_tracefs = TracefsTimerlat(
+        Path(args.tracefs_root),
+        args.timerlat_cpu,
+        args.period_us,
+        args.buffer_kb,
+        cpu_idle_cpu=args.timerlat_cpu if capture_cpu_idle else None,
+    )
 
     out = Path(args.data_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -742,10 +1088,30 @@ def run_campaign(args: argparse.Namespace) -> Path:
             "pressure_workload": "four bounded nice +10 CPU spin workers, pinned to configured load CPUs",
             "timerlat_user_workload": "one pinned SCHED_FIFO reader of timerlat_fd; no explicit computation",
             "control_clock_probe": "ClockPressure absolute CLOCK_MONOTONIC sampler pinned to probe CPU",
+            "turbostat": (
+                {
+                    "cpu": args.turbostat_cpu if args.turbostat_cpu is not None else args.timerlat_cpu,
+                    "interval_seconds": args.turbostat_interval_sec,
+                    "fields": _TURBOSTAT_FIELDS.split(","),
+                    "timestamp_semantics": "wall-clock label for alignment; not an independent elapsed-time reference",
+                }
+                if args.capture_turbostat
+                else None
+            ),
+            "cpu_idle_tracepoint": (
+                {
+                    "event": "power:cpu_idle",
+                    "cpu": args.timerlat_cpu,
+                    "state_names": cpu_idle_state_names,
+                    "trace_clock": initial_tracefs.before["trace_clock"],
+                    "semantics": "state index marks entry; 4294967295 marks exit from the prior state",
+                    "post_exit_match_lookback_ns": POST_EXIT_MATCH_LOOKBACK_NS,
+                }
+                if capture_cpu_idle
+                else None
+            ),
         },
-        "initial_tracefs_state": TracefsTimerlat(
-            Path(args.tracefs_root), args.timerlat_cpu, args.period_us, args.buffer_kb
-        ).before,
+        "initial_tracefs_state": initial_tracefs.before,
         "trials": [],
         "status": "running",
         "data_dir": str(out),
@@ -771,7 +1137,33 @@ def run_campaign(args: argparse.Namespace) -> Path:
     _write_json(campaign_path, campaign)
 
     total = len(plan)
+    turbostat_sampler = None
+    if args.capture_turbostat:
+        turbostat_sampler = TurbostatSampler(
+            out / "turbostat.tsv",
+            cpu=turbostat_cpu,
+            interval_sec=args.turbostat_interval_sec,
+        )
+        campaign["turbostat_capture"] = {
+            "status": "starting",
+            "output": "turbostat.tsv",
+            "stderr": "turbostat.stderr",
+            "cpu": turbostat_cpu,
+            "interval_seconds": args.turbostat_interval_sec,
+            "fields": _TURBOSTAT_FIELDS.split(","),
+        }
+        _write_json(campaign_path, campaign)
     try:
+        if turbostat_sampler is not None:
+            turbostat_sampler.start()
+            campaign["turbostat_capture"]["status"] = "running"
+            campaign["turbostat_capture"]["started_at_utc"] = (
+                turbostat_sampler.started_at_utc
+            )
+            campaign["turbostat_capture"]["observer_process_state"] = (
+                turbostat_sampler.observer_process_state
+            )
+            _write_json(campaign_path, campaign)
         for ordinal, (replicate, arm, condition, role) in enumerate(plan, start=1):
             print(
                 f"[{ordinal}/{total}] replicate={replicate} arm={arm} condition={condition}",
@@ -810,6 +1202,39 @@ def run_campaign(args: argparse.Namespace) -> Path:
     else:
         if campaign["status"] == "running":
             campaign["status"] = "complete"
+    finally:
+        if turbostat_sampler is not None:
+            try:
+                capture_record = turbostat_sampler.stop()
+                campaign["turbostat_capture"].update(capture_record)
+                has_sample = turbostat_sampler._has_sample()
+                campaign["turbostat_capture"]["status"] = (
+                    "stopped" if has_sample else "failed"
+                )
+                if not has_sample:
+                    campaign["status"] = "failed"
+                    campaign["failure"] = campaign.get("failure") or (
+                        "turbostat capture produced no timestamped sample"
+                    )
+                if (
+                    capture_record["returncode"] is not None
+                    and capture_record["returncode"]
+                    not in capture_record["expected_stop_returncodes"]
+                ):
+                    campaign["status"] = "failed"
+                    campaign["failure"] = (
+                        "turbostat collector exited unexpectedly: "
+                        f"{capture_record['returncode']}"
+                    )
+            except Exception as exc:
+                campaign["turbostat_capture"]["status"] = "failed"
+                campaign["turbostat_capture"]["error"] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                campaign["status"] = "failed"
+                campaign["failure"] = campaign.get("failure") or (
+                    f"turbostat capture cleanup failed: {type(exc).__name__}: {exc}"
+                )
     campaign["finished_at_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     _write_json(campaign_path, campaign)
     print(campaign_path)
