@@ -616,6 +616,8 @@ run_overhead(const options_t *opts)
     qsort(tai_gap, tai_n, sizeof(*tai_gap), compare_u64);
     if (ptp_gap)
         qsort(ptp_gap, ptp_n, sizeof(*ptp_gap), compare_u64);
+    if (ptp_precise_gap)
+        qsort(ptp_precise_gap, ptp_precise_n, sizeof(*ptp_precise_gap), compare_u64);
     printf("{\"kind\":\"overhead\",\"schema\":\"clockpressure.overhead.v2\","
            "\"samples\":%zu,\"pin_cpu\":%d,", n, opts->pin_cpu);
     json_string("ptp_path", opts->ptp_path ? opts->ptp_path : "", true);
