@@ -199,8 +199,32 @@ This journal separates implementation and test results from measurements perform
 
 ### Next
 
-- Compare explicit 800 µs and 1,000 µs requests, straddling the measured 890 µs C10 exit latency, to test whether the response changes at the C10 eligibility threshold or with any active QoS request.
+- ~~Compare explicit 800 µs and 1,000 µs requests, straddling the measured 890 µs C10 exit latency.~~ Completed in the threshold follow-up below.
 - Seek an independently calibrated elapsed-time reference before making a hardware-time claim.
+
+## 2026-10-28 — Explicit C10 eligibility-threshold follow-up
+
+### Implemented and executed
+
+- Extended the timerlat campaign design to keep an explicit 1,000 µs QoS request in the control arm while comparing an 800 µs intervention. This distinguishes crossing the measured 890 µs C10 exit-latency threshold from simply having an active request.
+- Completed campaign `20261028T061004Z-timerlat-campaign-989b334f` at code revision `e03c69b`: five randomized replicates per arm/condition, 30 seconds per observation, four pinned pressure workers, timerlat on CPU 7, probe on CPU 6, 30-second cooldowns and recovery waits.
+- Preserved raw data and analysis on worker-03 at `/home/worker-03/clockpressure-data/timerlat-c10-threshold-20261028/` and locally under `.clockpressure-data/worker-03/timerlat-c10-threshold-20261028/`. All 30 trials completed. The 30 traces passed checksum/reparse checks; 90,000 IRQ/thread pairs matched with 89,970 user-return records and no incomplete pairs, malformed lines, overruns or dropped events. Every QoS request and tracefs state restored. Maximum package temperature was 77°C.
+
+### Observed
+
+- With the 1,000 µs target, C10 residency medians were 89.27%/90.18%/86.95% on probe CPU 6 and 87.42%/90.59%/87.32% on timerlat CPU 7 across baseline/pressure/recovery. At 800 µs, C10 residency was zero on both CPUs in all conditions.
+- At baseline, the 800 µs arm reduced wake and timerlat P99 values by about 104–108 µs relative to 1,000 µs. The pressure-associated P99 reduction remained large in both arms: 326/316/325/363 µs for wake/IRQ/thread/user-return at 1,000 µs and 218/207/219/253 µs at 800 µs. The QoS-by-pressure interactions were about +101–107 µs, attenuating but not removing the pressure response.
+- The timerlat pressure response occurred while C10 remained near 90% on CPUs 6 and 7 under the 1,000 µs request; it also occurred with C10 at zero under 800 µs. This rules out a simple account in which the pressure effect is only the result of avoiding C10, but it does not isolate the full mechanism.
+- The PHC/MONORAW pressure interaction was +0.0465 ppb, with a descriptive interval from −0.0595 to +0.1184 ppb. The `CLOCK_MONOTONIC`/RAW interaction interval also included zero. Neither same-host comparison establishes actual elapsed-time accuracy.
+
+### Measurement-integrity note
+
+During late-campaign diagnostics, I opened `trace_pipe` shortly after a status poll had shown the timerlat tracer active. This interface can consume buffered trace events, so a transient effect around trial 22 cannot be ruled out. The retained trace contains complete IRQ and thread activation IDs 1–3,000, 2,999 user-return records, and zero buffer loss; no missing or duplicate IDs were found. I kept the raw trial and ran a sensitivity analysis without its QoS-800 pressure record. The four-replicate pressure interactions remained about +101–108 µs across all four latency outcomes, so the main interpretation did not change. Trial 22 remains flagged rather than being described as untouched by diagnostics.
+
+### Next
+
+- Add per-transition CPU idle state entry/exit events to timerlat runs on CPUs 6 and 7, then correlate each event with the immediately preceding state and idle duration.
+- Continue the search for an independently calibrated elapsed-time reference; no hardware clock-rate claim is supported yet.
 
 ## Findings ledger
 
@@ -213,8 +237,9 @@ This journal separates implementation and test results from measurements perform
 | CPU pressure changes aggregate per-CPU C10 residency | `observed cpuidle counters` | Residency fell by about 45.6 percentage points with four pinned CPUs busy and returned during recovery; package state and causality unmeasured |
 | CPU pressure changes timer wake lateness when sampler migration is removed | `sampler-affinity follow-up` | Five CPU 7-pinned pairs reproduced a 339.9 µs P99 reduction with zero migrations; migration is not required, mechanism still unresolved |
 | worker-03 timerlat reports per-CPU IRQ/thread latency | `tracefs diagnostic smoke` | 1,600 paired activations captured with no malformed/incomplete records; strong per-CPU differences require controlled replication |
-| CPU pressure changes IRQ-context timerlat P99 | `controlled timerlat campaign` | Five paired enabled-arm replicates reduced IRQ P99 by 315.6 µs; same-host latency observation, not clock-rate evidence |
+| CPU pressure changes timerlat P99 | `controlled timerlat and threshold campaigns` | Five randomized pairs per QoS arm reduced wake/IRQ/thread/user-return P99 by 218–363 µs; large response persists with C10 excluded and is not clock-rate evidence |
 | An 800 µs CPU latency constraint removes measured C10 residency and changes timer latency | `30-trial QoS intervention` | C10 fell to zero on CPUs 6 and 7; baseline P99 improved about 105 µs and the pressure response attenuated about 105 µs, while a large pressure effect remained |
+| Crossing the measured C10 latency threshold changes C10 eligibility and baseline latency | `30-trial 1,000-vs-800 µs threshold follow-up` | 1,000 µs allowed about 87–91% C10 residency on CPUs 6/7; 800 µs removed it. Baseline P99 fell about 104–108 µs, while pressure P99 remained similar across targets; trial 22 is flagged and excluded in sensitivity analysis |
 | CPU pressure causes a physical PHC clock-rate change | `internal cross-stamp fit` | A sub-ppb QoS interaction was estimated, but it is inconsistent with the prior campaign and below modeled capture uncertainty; no verified clock-rate finding |
 | Paired NIC-PHC cross-timestamps provide external elapsed-time authority | `hypothesis` | The ioctl works, but its calibration, shared-clock dependencies and capture uncertainty remain unverified |
 | An autonomous agent compromised a timing evaluator | `hypothesis` | Not studied |
