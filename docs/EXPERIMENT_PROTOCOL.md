@@ -1,6 +1,18 @@
-# Experiment protocol (initial proposal)
+# Experiment protocol and first implementation
 
-**State:** Proposed, not executed. Do not treat illustrative timings as measured worker-03 results.
+**State:** Initial bounded software-pilot protocol is implemented. Actual worker-03 execution is recorded separately in the [experimental journal](EXPERIMENT_JOURNAL.md). Do not treat this protocol or its configured limits as a measurement result.
+
+## Initial pilot boundary
+
+The first experiment measures Linux timer/scheduler behavior and internal clock relationships on the observed worker. It does **not** currently measure elapsed time against an independent external standard.
+
+The native probe records absolute `CLOCK_MONOTONIC` timer deadlines and samples `CLOCK_MONOTONIC`, `CLOCK_MONOTONIC_RAW`, `CLOCK_BOOTTIME`, `CLOCK_REALTIME`, `CLOCK_TAI`, RDTSCP/AUX and, when readable, the `e1000e` NIC PHC. The first `CLOCK_MONOTONIC` read after each wake is compared to the absolute deadline. This is **timer delivery + scheduling + timestamp-acquisition latency**, not clock-rate error or a pure timer-interrupt latency. `CLOCK_MONOTONIC` begins each acquisition bracket and is read again after the other sources; the full bracket is retained. Inter-read gaps in `overhead.json` include userspace call/setup time and must not be described as isolated clock_gettime service cost.
+
+The eBPF witness stores the kernel timestamp at `sched:sched_wakeup` for the probe TID and reports the next matching `sched:sched_switch`. This estimates runnable-to-running latency. It omits timer-expiry-to-wakeup time, shares the kernel monotonic dependency and is filtered to the target task. The source is `instrumentation/sched_wakeup.bt`; raw events and stderr are retained. Scheduler sample CPU IDs and TSC_AUX values provide migration diagnostics.
+
+The pressure treatment is four bounded, CPU-bound workers pinned to CPUs 1–4 at nice `+10`. The probe is unpinned by default. The campaign starts with a baseline that has no ClockPressure-generated load, then seed-randomizes replicated baseline/pressure trials with eBPF on/off as requested. A recovery wait and no-load recovery measurement follow each pressure trial. Thermal, frequency, PSI and SenseTrace service-cgroup context are sampled once per second. The pilot aborts at 85°C CPU-package temperature. It does not change system-wide clocks, CPU limits, boot parameters or firmware.
+
+Data defaults to a private directory outside the checkout, with per-run raw JSONL, a per-run manifest, artifact checksums and `.in-progress` preservation after failed/interrupted runs. A campaign sentinel baseline is deliberately collected before the randomized part; this protects the stated initial no-load baseline but means the sequence is not perfectly randomized. Subsequent baseline/pressure runs are randomized with the stored seed.
 
 ## General method
 
@@ -15,10 +27,10 @@ Use a preregistered matrix of control and bounded-pressure conditions. Preserve 
 5. Verify eBPF attachment privilege and kernel support *without changing* global settings or installing production-impacting hooks.
 6. Calibrate timestamping overhead and reference synchronization / external event capture, if used.
 
-### Phase B: idle baseline
+### Phase B: pressure-free baseline
 
-- Collect multiple runs at idle with fixed acquisition duration and repeatable start / stop markers.
-- Record DUT / reference start and end, timer wakeups, scheduling latency quantiles, CPU utilization, available temperature/frequency, lost events, and sampling overhead.
+- Collect multiple runs without ClockPressure-generated work; log background services and PSI rather than asserting that the whole machine is idle.
+- Record start/end readings, absolute timer wakeups, runnable-to-running latency, timestamp acquisition brackets, CPU/AUX distribution, available temperature/frequency, lost/malformed events, and observer overhead.
 - Run the same measurement with eBPF off, then on, to estimate observer effect.
 - Record ambient workload and timestamps of any clock adjustments or node configuration changes.
 
@@ -41,7 +53,7 @@ Proposed factors (each independently, then small selected combinations where saf
 | CPU power / thermal state | Cross-clock discrepancy or timing changes | Log governor, temperature, throttling, steady-state |
 | Guest / host timekeeping (if applicable) | Cross-boundary clock disagreement | Explicitly identify virtualized versus bare-metal source |
 
-Use fixed resource ceilings, bounded durations, recovery periods, and randomized or counterbalanced condition ordering. Do not change system-wide time, kernel boot arguments, power limits, BIOS/UEFI or firmware as part of routine experiments.
+Use fixed resource ceilings, bounded durations, recovery periods, and randomized or counterbalanced condition ordering. Do not change system-wide time, kernel boot arguments, power limits, BIOS/UEFI or firmware as part of routine experiments. The first automated workload only saturates four explicitly pinned CPU cores at lower scheduling priority; it does not yet perform memory, I/O, voltage or clock-frequency interventions.
 
 ### Phase E: cross-clock comparison
 
@@ -65,13 +77,13 @@ Use fixed resource ceilings, bounded durations, recovery periods, and randomized
 - Counters for probe invocation, event drop, ring buffer utilization and lost samples.
 - Optional sampled CPU or kernel trace context rather than exhaustive per-event logging.
 
-Probe names, structures, and privileges must be checked on the real kernel; no BPF implementation or host probes are currently claimed. Watch for tracing overhead, probe perturbation, and loss. Avoid capturing user data, process arguments, or payloads not needed for the hypothesis.
+Probe names, structures, and privileges are checked on the target kernel. The first BPF program attaches only scheduler tracepoints and emits target-TID runnable-to-run records; it does not collect process arguments, names, user data or unrelated payloads. Check probe attach/detach, stderr, event counts and malformed lines. Compare eBPF-off/on trials because tracing itself perturbs scheduling.
 
 ## Analysis and interpretation
 
-Calculate each run's signed rate error and corresponding ppm using [clock model](CLOCKS_AND_INDEPENDENCE.md). Summarize timer wakeup lateness separately from clock-rate error; give distribution quantiles, sample counts, repeat-to-repeat variability, reference uncertainty, excluded runs with reasons, and data-loss counters.
+Compare internal endpoint rates in ppm only with their full dependency labels, and summarize timer wakeup lateness separately. The analysis reports run-level quantiles, robust exploratory latency outlier counts, the endpoint timestamp-bracket bound, per-run clock intervals, paired baseline-versus-pressure and eBPF-on/off differences, and descriptive bootstrap intervals when at least three run pairs exist. The bootstrap resamples independent run-pair summaries, never autocorrelated timer samples. Its interval is exploratory within one host/campaign and is not a calibration uncertainty budget. Report reference uncertainty, sample counts, run-to-run variability, exclusions and event-loss/malformed-record evidence. No current result can be called externally validated drift.
 
-Predeclare primary comparisons and error thresholds in a versioned protocol revision **before** experimental collection. No arbitrary 1% success threshold is required. Distinguish exploratory correlation from experimentally supported causal mechanism.
+Predeclare primary comparisons and error thresholds in a versioned protocol revision **before** the relevant campaign. No arbitrary 1% success threshold is required. Distinguish exploratory correlation from experimentally supported causal mechanism. The first implemented protocol is intentionally small: CPU pressure, no-load/recovery controls, optional scheduler witness and internal clocks.
 
 ## Stop conditions
 

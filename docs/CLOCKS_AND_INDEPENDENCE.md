@@ -61,6 +61,14 @@ Do not infer physical clock drift from raw absolute timestamp subtraction across
 
 eBPF can observe sched switches, wakeups, selected timer events, and kernel timestamp fields with low overhead in many environments. It **cannot** provide a separate reference merely by attaching to a different probe. Use lost-event counters and sampling budgets to assess observer effects.
 
+## worker-03 dependency map
+
+The current worker has a Dell/Intel platform with Linux clocksource `tsc` selected, `acpi_pm` available as a secondary clocksource, and per-CPU `lapic-deadline` clock-event devices. HPET is advertised by firmware but explicitly disabled by the kernel due to PC10 behavior and missing ACPI `_CRS` resources; `/dev/hpet` alone does not make it usable. The CPU exposes `constant_tsc`, `nonstop_tsc`, `rdtscp` and `tsc_deadline_timer` and Linux refined TSC frequency to about 3.0 GHz at boot. These facts identify the internal path; they do not certify its absolute accuracy.
+
+For this host, monotonic APIs and `bpf_ktime_get_ns()` must be treated as a related family. `CLOCK_MONOTONIC_RAW` is not a different oscillator. The Intel I219-LM `e1000e` driver exposes an IEEE-1588 PHC with hardware RX/TX timestamps and a “Precise” provider label; ClockPressure can read it by opening `/dev/ptp0` and converting its file descriptor to a dynamic clock ID. This makes it a useful candidate cross-check. It does **not** establish oscillator independence, calibration, synchronization state, endpoint alignment or the size of the PHC read uncertainty. Chrony/NTP state can explain host frequency discipline but the sampled host clocks still use the kernel timekeeping path. The one-second RTC and currently unusable HPET are not substitutes for an independent high-resolution reference.
+
+The hardware details are an observed snapshot; see [worker-03 inventory](WORKER_03.md). Every run manifest stores only a pseudonymized host name and omits machine serials, UUIDs and network addresses.
+
 ## Further reading
 
 - [Linux clocksource / clockevents](https://docs.kernel.org/timers/timekeeping.html)

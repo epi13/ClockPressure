@@ -4,19 +4,25 @@
 
 Raw measurements are the evidence. Derived summaries, charts and agent explanations are projections that should be reproducible from recorded inputs and versioned analysis code.
 
-## Recommended layout (when implementation begins)
+## Implemented output layout
 
 ```text
-data/
-  README.md                   # storage, privacy, sharing policy
-  examples/                   # small synthetic fixtures only
-experiments/
-  <protocol-version>/         # scripts/configuration
-results/
-  <run-id>/                   # local or external artifacts; not committed by default
+~/clockpressure-data/
+  campaigns/<campaign-id>.json
+  runs/<run-id>/
+    manifest.json             # environment, conditions, revision and hashes
+    probe.jsonl                # native sample / endpoint events
+    scheduler.jsonl            # optional target-TID eBPF events
+    scheduler.stderr           # attach, diagnostics and loss messages
+    overhead.json              # clock inter-read-gap quantiles
+    telemetry.jsonl            # temperature/frequency/PSI context, about 1 Hz
+    workload.jsonl             # pressure start/stop and CPU affinity
+    *.stderr                   # process diagnostics
+  analysis.json
+  analysis.md
 ```
 
-Large or privacy-sensitive raw traces should stay outside normal Git history and be referenced with checksums and access-controlled storage where needed. Do not commit private worker-03 details. Synthetic fixtures must be explicitly marked.
+Raw observations are generated outside the checkout under `~/clockpressure-data/`, with directory permissions restricted to the worker account. Each completed run has checksums for every raw artifact; incomplete data remains in a `.in-progress` directory. Keep worker identifiers pseudonymized. Do not commit raw worker data, exact serials, UUIDs, network addresses, credentials or unrelated application content. Synthetic demonstrations are labeled and never enter hardware run storage.
 
 ## Per-run manifest
 
@@ -31,6 +37,8 @@ Minimum fields:
 | Instrumentation | eBPF program / version, hooks, sampling, dropped events, trace overhead / budget |
 | Data | raw artifact path / URI, SHA-256 checksum, units / schema version |
 | Outcome | completion / abort reason, exclusions, anomalies, recovery state |
+
+The implementation records a clock snapshot/environment on both sides of the trial, the native probe's actual UID/EUID and clock resolutions, campaign ID/replicate/role, start/end intervals by available clock, artifact checksums, periodic CPU frequency/temperature, Linux pressure-stall information, memory availability and SenseTrace service-cgroup resource counters. It deliberately omits DMI serials/UUIDs, upstream NTP host/IP and process command lines.
 
 ## Sample event schema (design only)
 
@@ -52,6 +60,8 @@ cpu_id,event_type,condition_id,value,unit,flags
 Publish for each condition: raw count, exclusions, uncertainty, event-loss rate, baseline / pressure / recovery distributions, latency quantiles, estimated rate discrepancy (signed ppm), confidence / sensitivity analyses, and exact test version. Keep exploratory findings separate from preregistered hypotheses.
 
 A genuine externally validated drift claim requires a description of the independent reference *and how boundaries are latched*, not just a plot of two host clocks.
+
+The current analysis estimates monotonic/RAW and optional PHC rates across the same process start/end sequence and reports the sum of their endpoint read brackets in ppm. That bracket is an acquisition-alignment bound only; it is not oscillator calibration uncertainty. Pairwise bootstrap intervals use replicate-level P99-lateness differences and are marked unavailable when fewer than three run pairs exist. They describe between-run variation within one campaign; they are not external-clock confidence bounds and should not be inferred from per-sample independent resampling.
 
 ## Reproduction checklist
 

@@ -21,9 +21,9 @@ For clarity, record:
 
 ## Stage 1: explicit positive control
 
-Construct a small, deterministic example of **bad software timing**, e.g. fixed-count iterations that each add an assumed 10 ms although callbacks are delayed. A separate correct elapsed-time clock should show the discrepancy.
+Run [`demos/timing_contract_positive_control.py`](../demos/timing_contract_positive_control.py). Its child waits 40 times for 20 ms but increments a software counter by an assumed 10 ms per wait. The weak evaluator trusts that counter and accepts the 400 ms report against a 500 ms deadline. A parent process times the entire child from launch through exit with `CLOCK_MONOTONIC_RAW`; its measured duration is expected near 800 ms, so the stronger same-host evaluator rejects the contract. The program independently asserts that the two outcomes separate.
 
-The control illustrates measurement failure but **does not** prove a real hardware clock was slowed. Do not imply an agent discovered the exploit; a human-designed control is a different result.
+The control is a constructed software accounting defect. The parent's measurement authority is separate from the child's counter, but the parent clock still shares this host's kernel timekeeping path and is not an external time standard. It does **not** prove a real hardware clock was slowed, and no agent discovered the defect.
 
 ## Stage 2: discovered system effect (conditional)
 

@@ -1,0 +1,19 @@
+BEGIN
+{
+    printf("{\"kind\":\"observer_start\",\"clock_id\":\"bpf_ktime_get_ns\",\"target_tid\":%d}\n", CP_TARGET);
+}
+
+tracepoint:sched:sched_wakeup
+/args->pid == CP_TARGET/
+{
+    @wake_ns[args->pid] = nsecs;
+}
+
+tracepoint:sched:sched_switch
+/args->next_pid == CP_TARGET && @wake_ns[args->next_pid] != 0/
+{
+    $now = nsecs;
+    printf("{\"kind\":\"sched_runnable_to_run\",\"clock_id\":\"bpf_ktime_get_ns\",\"tid\":%d,\"cpu\":%d,\"wake_ns\":%llu,\"switch_ns\":%llu,\"runnable_latency_ns\":%llu}\n",
+           args->next_pid, cpu, @wake_ns[args->next_pid], $now, $now - @wake_ns[args->next_pid]);
+    delete(@wake_ns[args->next_pid]);
+}
