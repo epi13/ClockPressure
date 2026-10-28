@@ -1,0 +1,33 @@
+# Local results and private instrumentation
+/results/
+/data/raw/
+/data/private/
+/tmp/
+/scratch/
+*.perf.data
+perf.data*
+*.trace
+*.pcap
+*.pcapng
+*.core
+core
+*.log
+
+# Local builds and tooling
+/build/
+/target/
+/.venv/
+__pycache__/
+*.py[cod]
+*.o
+*.so
+*.d
+*.tmp
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
