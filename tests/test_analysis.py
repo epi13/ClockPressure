@@ -7,6 +7,7 @@ from analysis.analyze_runs import (
     _bootstrap_mean_interval,
     _group_summaries,
     _period_errors,
+    _paired_crossstamp_dynamics,
     _paired_crossstamp_rate,
     _quantiles,
     _rate_comparison,
@@ -48,6 +49,19 @@ class TestAnalysis(unittest.TestCase):
         self.assertEqual(result["capture_method"], "PTP_SYS_OFFSET_PRECISE")
         self.assertIn("not quantified", result["capture_uncertainty"])
         self.assertEqual(result["sys_realtime_minus_paired_sys_monoraw_ppm"], 20)
+
+    def test_crossstamp_dynamics_fits_offset_slope_from_paired_samples(self):
+        records = [
+            {"kind": "start", "ptp_precise_sys_monoraw_ns": 1_000_000_000, "ptp_precise_ns": 9_000_000_000},
+            {"kind": "sample", "ptp_precise_sys_monoraw_ns": 2_000_000_000, "ptp_precise_ns": 9_999_998_000},
+            {"kind": "sample", "ptp_precise_sys_monoraw_ns": 3_000_000_000, "ptp_precise_ns": 10_999_996_000},
+            {"kind": "end", "ptp_precise_sys_monoraw_ns": 4_000_000_000, "ptp_precise_ns": 11_999_994_000},
+        ]
+        result = _paired_crossstamp_dynamics(records)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["least_squares_rate_difference_ppm"], -2)
+        self.assertEqual(result["offset_span_ns"], 6_000)
+        self.assertEqual(result["absolute_fit_residual_ns"]["max"], 0)
 
     def test_sample_period_error_uses_skipped_sequence_delta(self):
         samples = [

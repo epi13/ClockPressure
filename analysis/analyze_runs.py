@@ -96,6 +96,44 @@ def _paired_crossstamp_rate(start: dict[str, Any], end: dict[str, Any]) -> dict[
     return result
 
 
+def _paired_crossstamp_dynamics(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    pairs = [
+        (record["ptp_precise_sys_monoraw_ns"], record["ptp_precise_ns"])
+        for record in records
+        if record.get("kind") in ("start", "sample", "end")
+        and record.get("ptp_precise_sys_monoraw_ns") is not None
+        and record.get("ptp_precise_ns") is not None
+    ]
+    pairs.sort(key=lambda pair: pair[0])
+    if len(pairs) < 3:
+        return None
+    origin_system, origin_device = pairs[0]
+    elapsed = [system - origin_system for system, _ in pairs]
+    offset = [device - system - (origin_device - origin_system) for system, device in pairs]
+    if elapsed[-1] <= elapsed[0]:
+        return None
+    mean_elapsed = statistics.mean(elapsed)
+    mean_offset = statistics.mean(offset)
+    variance = sum((value - mean_elapsed) ** 2 for value in elapsed)
+    if variance <= 0:
+        return None
+    slope = sum(
+        (x - mean_elapsed) * (y - mean_offset) for x, y in zip(elapsed, offset)
+    ) / variance
+    residuals = [
+        abs(y - (mean_offset + slope * (x - mean_elapsed)))
+        for x, y in zip(elapsed, offset)
+    ]
+    return {
+        "paired_sample_count": len(pairs),
+        "elapsed_ns": elapsed[-1] - elapsed[0],
+        "offset_span_ns": max(offset) - min(offset),
+        "least_squares_rate_difference_ppm": slope * 1_000_000,
+        "absolute_fit_residual_ns": _quantiles(residuals),
+        "uncertainty": "descriptive fit only; serial correlation and cross-timestamp capture uncertainty are not modeled",
+    }
+
+
 def _period_errors(samples: list[dict[str, Any]], period_ns: int, clock: str) -> list[float]:
     ordered = sorted(samples, key=lambda sample: sample["seq"])
     errors = []
@@ -407,6 +445,7 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
             )
         },
         "paired_crossstamp_rate": _paired_crossstamp_rate(start, end),
+        "paired_crossstamp_dynamics": _paired_crossstamp_dynamics(records),
         "wakeup_lateness_ns": _quantiles(lateness),
         "wakeup_lateness_exploratory_outliers": _robust_outlier_count(lateness),
         "sample_period_error_ppm_vs_requested_period": {
@@ -452,6 +491,11 @@ def _group_summaries(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             for run in members
             if run.get("paired_crossstamp_rate")
         ]
+        crossstamp_fits = [
+            run["paired_crossstamp_dynamics"]["least_squares_rate_difference_ppm"]
+            for run in members
+            if run.get("paired_crossstamp_dynamics")
+        ]
         summaries.append(
             {
                 "condition": condition,
@@ -463,6 +507,7 @@ def _group_summaries(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "run_monotonic_minus_raw_ppm": _quantiles(mono_rates),
                 "run_ptp_minus_raw_ppm": _quantiles(ptp_rates),
                 "run_ptp_precise_minus_paired_sys_monoraw_ppm": _quantiles(crossstamp_rates),
+                "run_ptp_precise_time_series_fit_ppm": _quantiles(crossstamp_fits),
             }
         )
     return summaries
@@ -548,6 +593,7 @@ def _markdown(report: dict[str, Any]) -> str:
         raw = run.get("internal_rate_comparisons", {}).get("monotonic_vs_raw") or {}
         ptp = run.get("internal_rate_comparisons", {}).get("ptp_vs_raw") or {}
         paired_ptp = run.get("paired_crossstamp_rate") or {}
+        crossstamp_fit = run.get("paired_crossstamp_dynamics") or {}
         latency = run["wakeup_lateness_ns"]
         sched = run["scheduler_witness"]["runnable_latency_ns"]
         mono = "{rate} / ±{bound}".format(
@@ -559,7 +605,7 @@ def _markdown(report: dict[str, Any]) -> str:
             bound=_fmt(ptp.get("endpoint_read_bracket_bound_ppm")),
         )
         rows.append(
-            "| {id} | {condition} | {observer} | {n} | {wake_p99} | {mono} | {nic} | {paired_ptp} | {sched_p99} |".format(
+            "| {id} | {condition} | {observer} | {n} | {wake_p99} | {mono} | {nic} | {paired_ptp} | {crossstamp_fit} | {sched_p99} |".format(
                 id=run["run_id"],
                 condition=run["condition"],
                 observer=run["observer"],
@@ -568,6 +614,7 @@ def _markdown(report: dict[str, Any]) -> str:
                 mono=mono,
                 nic=nic,
                 paired_ptp=_fmt(paired_ptp.get("difference_ppm_vs_paired_sys_monoraw")),
+                crossstamp_fit=_fmt(crossstamp_fit.get("least_squares_rate_difference_ppm")),
                 sched_p99=_fmt(sched.get("p99")),
             )
         )
@@ -589,8 +636,8 @@ def _markdown(report: dict[str, Any]) -> str:
             "",
             f"Runs analyzed: {len(report['runs'])}",
             "",
-            "| Run | Condition | eBPF | Samples | Wake late p99 (ns) | MONOTONIC–RAW ppm / endpoint bound | NIC PHC–RAW ppm / endpoint bound | PHC vs paired MONORAW crossstamp (ppm) | eBPF runnable latency p99 (ns) |",
-            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Run | Condition | eBPF | Samples | Wake late p99 (ns) | MONOTONIC–RAW ppm / endpoint bound | NIC PHC–RAW ppm / endpoint bound | PHC vs paired MONORAW endpoints (ppm) | PHC/MONORAW offset fit (ppm) | eBPF runnable latency p99 (ns) |",
+            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             *rows,
             "",
             "## Paired within-campaign contrasts",
@@ -638,6 +685,7 @@ def _markdown(report: dict[str, Any]) -> str:
             "- `CLOCK_MONOTONIC`, `CLOCK_MONOTONIC_RAW`, `CLOCK_BOOTTIME`, and eBPF `bpf_ktime_get_ns()` share the kernel timekeeping path or related hardware. Their differences are internal diagnostics.",
             "- The Intel e1000e PHC is a candidate separate hardware clock. This pilot does not establish oscillator independence, calibration uncertainty, or independent capture of the exact endpoints.",
             "- When available, `PTP_SYS_OFFSET_PRECISE` returns a driver-supported PHC/system cross-timestamp. Its paired rate result reduces userspace read-order ambiguity but remains an internal comparison with unquantified cross-timestamp accuracy; it is not an external standard.",
+            "- The paired PHC/MONORAW offset fit uses all retained cross-timestamps. Its residual spread is descriptive; no confidence interval is reported because samples are serially correlated and driver cross-timestamp accuracy is unquantified.",
             "- CPU C10 residency is the aggregate fraction of per-CPU capacity spent in the named cpuidle state. It does not expose package C-state residency or prove the cause of timer wakeup changes.",
             "- Endpoint read brackets are reported as conservative acquisition bounds; they are not calibration certificates or a complete uncertainty budget.",
             "- No external elapsed-time reference was acquired, so these data cannot establish physical clock drift or a hardware-caused false pass.",
