@@ -25,7 +25,7 @@ _TIMERLAT_IRQ_LINE = re.compile(
 )
 _IDLE_EXIT = 0xFFFFFFFF
 _NS_PER_SECOND = Decimal(1_000_000_000)
-_POST_EXIT_LOOKBACK_NS = 10_000
+POST_EXIT_MATCH_LOOKBACK_NS = 25_000
 
 
 def analyze_idle_transitions(
@@ -140,7 +140,7 @@ def analyze_idle_transitions(
         if last_completed_interval is not None:
             completed_state, entry_timestamp, exit_timestamp = last_completed_interval
             after_exit_ns = int((timestamp - exit_timestamp) * _NS_PER_SECOND)
-            if 0 <= after_exit_ns <= _POST_EXIT_LOOKBACK_NS:
+            if 0 <= after_exit_ns <= POST_EXIT_MATCH_LOOKBACK_NS:
                 entries_by_state[completed_state].append(fields["latency_ns"])
                 entry_to_irq_by_state[completed_state].append(
                     int((timestamp - entry_timestamp) * _NS_PER_SECOND)
@@ -176,7 +176,7 @@ def analyze_idle_transitions(
         "cpu": cpu,
         "clock_domain": "same-CPU ftrace timestamp stream; not an independent elapsed-time reference",
         "idle_exit_sentinel": _IDLE_EXIT,
-        "post_exit_match_lookback_ns": _POST_EXIT_LOOKBACK_NS,
+        "post_exit_match_lookback_ns": POST_EXIT_MATCH_LOOKBACK_NS,
         "timerlat_irq_events": irq_event_count,
         "matched_idle_state_activations": matched_activations,
         "matched_while_idle_state_open": sum(

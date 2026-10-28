@@ -66,7 +66,7 @@ class TestIdleTransitionAnalysis(unittest.TestCase):
             "<idle>-0 [007] d.h1. 10.010001: #1 context irq timer_latency 30000 ns\n"
             "swapper/7-0 [007] .... 11.000000: cpu_idle: state=3 cpu_id=7\n"
             "swapper/7-0 [007] .... 11.000100: cpu_idle: state=4294967295 cpu_id=7\n"
-            "<idle>-0 [007] d.h1. 11.000111: #2 context irq timer_latency 31000 ns\n"
+            "<idle>-0 [007] d.h1. 11.000126: #2 context irq timer_latency 31000 ns\n"
         )
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "trace"
@@ -78,6 +78,7 @@ class TestIdleTransitionAnalysis(unittest.TestCase):
         self.assertEqual(result["matched_after_idle_exit"], 1)
         self.assertEqual(result["matched_while_idle_state_open"], 0)
         self.assertEqual(result["unmatched_timerlat_irq_events"], 1)
+        self.assertEqual(result["post_exit_match_lookback_ns"], 25_000)
         states = {item["state_id"]: item for item in result["per_state"]}
         self.assertEqual(states[8]["timerlat_irq_phase_counts"]["after_idle_exit"], 1)
         self.assertEqual(states[8]["trace_exit_to_irq_ns"]["median"], 1000)

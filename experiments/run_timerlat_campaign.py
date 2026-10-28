@@ -23,7 +23,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from analysis.analyze_timerlat import analyze_trace
-from analysis.analyze_idle_transitions import analyze_idle_transitions
+from analysis.analyze_idle_transitions import (
+    POST_EXIT_MATCH_LOOKBACK_NS,
+    analyze_idle_transitions,
+)
 from experiments.environment import snapshot_environment
 from experiments.run_trial import _parse_cpus, _write_json
 
@@ -59,6 +62,28 @@ def _relative_artifact(path: Path, root: Path) -> str:
 def _empty_trace(trace: str) -> bool:
     match = _BUFFER_COUNT.search(trace)
     return bool(match and match.group(1) == "0" and match.group(2) == "0")
+
+
+def _cpu_buffer_integrity(stats: str) -> dict[str, int | None]:
+    parsed: dict[str, int | None] = {
+        "overrun": None,
+        "commit_overrun": None,
+        "dropped_events": None,
+    }
+    labels = {
+        "overrun": "overrun",
+        "commit overrun": "commit_overrun",
+        "dropped events": "dropped_events",
+    }
+    for line in stats.splitlines():
+        key, separator, value = line.partition(":")
+        if not separator or key.strip() not in labels:
+            continue
+        try:
+            parsed[labels[key.strip()]] = int(value.strip())
+        except ValueError:
+            continue
+    return parsed
 
 
 def _normalized_event_filter(raw_filter: str | None) -> str | None:
@@ -644,6 +669,22 @@ def _run_trial(
                 "duplicate_activation_events": analysis["duplicate_activation_event_count"],
                 "malformed_latency_lines": analysis["malformed_latency_line_count"],
             }
+            buffer_integrity = _cpu_buffer_integrity(
+                trace_record.get("cpu_buffer_stats", "")
+            )
+            entry["timerlat_buffer_integrity"] = buffer_integrity
+            buffer_losses = {
+                name: value
+                for name, value in buffer_integrity.items()
+                if value not in (None, 0)
+            }
+            if buffer_losses:
+                entry["error"] = (
+                    "timerlat trace buffer lost events: "
+                    + ", ".join(f"{name}={value}" for name, value in buffer_losses.items())
+                    + "; increase --buffer-kb or reduce trace-event volume"
+                )
+                entry["status"] = "failed"
             if getattr(args, "capture_cpu_idle", False):
                 state_names = {
                     int(key): value
@@ -661,24 +702,32 @@ def _run_trial(
                 )
                 entry["cpu_idle_transition_summary"] = idle_analysis
                 if idle_analysis["cpu_idle_events"] == 0:
-                    entry["error"] = "power:cpu_idle capture produced no events"
+                    entry["error"] = entry.get("error") or (
+                        "power:cpu_idle capture produced no events"
+                    )
                     entry["status"] = "failed"
             entry["tracefs_restoration"] = {
                 key: value for key, value in trace_record.items() if key != "trace"
             }
             if not analysis["matched_irq_thread_activation_count"]:
-                entry["error"] = "timerlat trace retained no matched IRQ/thread activation"
+                entry["error"] = entry.get("error") or (
+                    "timerlat trace retained no matched IRQ/thread activation"
+                )
                 entry["status"] = "failed"
             if not trace_record.get("restored"):
-                entry["error"] = "tracefs settings were not restored to their prior state"
+                entry["error"] = entry.get("error") or (
+                    "tracefs settings were not restored to their prior state"
+                )
                 entry["status"] = "failed"
     if qos_record is not None:
         entry["cpu_dma_latency_request"] = qos_record
         if not qos_record.get("restored"):
-            entry["error"] = "CPU latency QoS did not return to its prior effective value"
+            entry["error"] = entry.get("error") or (
+                "CPU latency QoS did not return to its prior effective value"
+            )
             entry["status"] = "failed"
     if error:
-        entry["error"] = error
+        entry["error"] = entry.get("error") or error
         entry["status"] = "failed"
     if trial_returncode not in (0, None):
         entry["error"] = entry.get("error") or f"ClockPressure trial exited {trial_returncode}"
@@ -872,6 +921,7 @@ def run_campaign(args: argparse.Namespace) -> Path:
                     "state_names": cpu_idle_state_names,
                     "trace_clock": initial_tracefs.before["trace_clock"],
                     "semantics": "state index marks entry; 4294967295 marks exit from the prior state",
+                    "post_exit_match_lookback_ns": POST_EXIT_MATCH_LOOKBACK_NS,
                 }
                 if capture_cpu_idle
                 else None

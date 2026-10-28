@@ -14,6 +14,7 @@ from experiments.run_timerlat_campaign import (
     CpuDmaLatencyRequest,
     TracefsTimerlat,
     _empty_trace,
+    _cpu_buffer_integrity,
     _normalized_event_filter,
     _option_enabled,
 )
@@ -137,6 +138,18 @@ class TestTimerlatCampaignAnalysis(unittest.TestCase):
 
 
 class TestTracefsHelpers(unittest.TestCase):
+    def test_cpu_buffer_integrity_parses_loss_counters(self):
+        self.assertEqual(
+            _cpu_buffer_integrity(
+                "entries: 100\noverrun: 4\ncommit overrun: 1\ndropped events: 2\n"
+            ),
+            {"overrun": 4, "commit_overrun": 1, "dropped_events": 2},
+        )
+        self.assertEqual(
+            _cpu_buffer_integrity("entries: 100\noverrun: 0\ndropped events: 0\n"),
+            {"overrun": 0, "commit_overrun": None, "dropped_events": 0},
+        )
+
     def test_normalizes_stale_tracefs_filter_diagnostics(self):
         self.assertEqual(
             _normalized_event_filter("none\n ^\nparse_error: Field not found: cpu_id\n"),
