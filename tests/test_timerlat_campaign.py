@@ -54,11 +54,18 @@ class TestTimerlatCampaignAnalysis(unittest.TestCase):
                         },
                         "environment_telemetry": {
                             "cpu_idle_residency_pct_of_cpu_capacity_by_state_name": {
-                                "C10": 95 if condition == "baseline" else 50 if condition == "cpu_pressure" else 95
+                                "C9": 2 if condition != "cpu_pressure" else 5,
+                                "C10": 95 if condition == "baseline" else 50 if condition == "cpu_pressure" else 95,
                             },
                             "cpu_idle_residency_pct_by_cpu_state_name": {
-                                "cpu6": {"C10": 80 if condition != "cpu_pressure" else 90},
-                                "cpu7": {"C10": 95 if condition != "cpu_pressure" else 70},
+                                "cpu6": {
+                                    "C9": 20 if condition != "cpu_pressure" else 30,
+                                    "C10": 80 if condition != "cpu_pressure" else 90,
+                                },
+                                "cpu7": {
+                                    "C9": 10 if condition != "cpu_pressure" else 15,
+                                    "C10": 95 if condition != "cpu_pressure" else 70,
+                                },
                             },
                         },
                         "sample_cpu_migrations_between_adjacent_samples": 0,
@@ -115,6 +122,12 @@ class TestTimerlatCampaignAnalysis(unittest.TestCase):
             -25,
         )
         self.assertEqual(
+            contrasts[("timerlat_user", "pressure_minus_baseline", "probe_cpu_c9_residency")][
+                "paired_difference"]["median"
+            ],
+            10,
+        )
+        self.assertEqual(
             report["observer_effects"][0]["paired_difference"]["median"],
             10,
         )
@@ -143,6 +156,7 @@ class TestTracefsHelpers(unittest.TestCase):
                 "<...>-12 [007] ....1 1.1: #1 context thread timer_latency 30 ns\n"
                 "<idle>-0 [007] d.h1. 2.0: #2 context irq timer_latency 25 ns\n"
                 "<...>-12 [007] ....1 2.1: #2 context thread timer_latency 35 ns\n"
+                "<...>-12 [007] ....1 2.2: #2 context user-ret timer_latency 40 ns\n"
             )
             campaign_path = root / "campaign.json"
             campaign_path.write_text(
@@ -177,6 +191,7 @@ class TestTracefsHelpers(unittest.TestCase):
             self.assertEqual(result["timerlat_activation_integrity"]["matched_irq_thread_activations"], 2)
             self.assertEqual(result["timerlat_buffer_stats"]["overrun"], 0)
             self.assertEqual(report["timerlat_integrity"]["trace_buffer_dropped_events"], 0)
+            self.assertEqual(report["timerlat_integrity"]["user_return_activations"], 1)
 
     def test_analyzer_flags_complete_manifest_with_failed_trial(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -231,6 +246,7 @@ class TestTracefsHelpers(unittest.TestCase):
                 tracefs_root="/tmp/tracefs-test",
                 cpu_dma_latency_path="/dev/cpu_dma_latency",
                 dma_latency_us=0,
+                control_dma_latency_us=None,
                 intertrial_cooldown_sec=0,
                 data_dir=str(Path(temporary) / "campaign"),
             )
@@ -258,23 +274,28 @@ class TestTracefsHelpers(unittest.TestCase):
             self.assertEqual(campaign["status"], "failed")
             self.assertEqual(campaign["trials"][0]["status"], "failed")
 
-    def test_qos_campaign_compares_default_and_intervention_arms(self):
+    def test_qos_campaign_compares_two_active_request_arms(self):
         campaign = {
             "campaign_id": "qos-fixture",
             "status": "complete",
             "design": {
-                "arms": ["timerlat_user_default", "timerlat_user_pm_qos"],
-                "timerlat_arms": ["timerlat_user_default", "timerlat_user_pm_qos"],
+                "arms": ["timerlat_user_pm_qos_control", "timerlat_user_pm_qos"],
+                "timerlat_arms": ["timerlat_user_pm_qos_control", "timerlat_user_pm_qos"],
                 "cpu_dma_latency_intervention": {
                     "arm": "timerlat_user_pm_qos",
-                    "requested_us": 0,
+                    "control_arm": "timerlat_user_pm_qos_control",
+                    "requested_us": 800,
+                    "control_requested_us": 1000,
                 },
             },
             "trials": [],
         }
         probes = {}
         timers = {}
-        for arm, delta in (("timerlat_user_default", 0), ("timerlat_user_pm_qos", -100)):
+        for arm, delta in (
+            ("timerlat_user_pm_qos_control", 0),
+            ("timerlat_user_pm_qos", -100),
+        ):
             for condition, condition_delta in (("baseline", 0), ("cpu_pressure", -10), ("recovery", 0)):
                 probes[(arm, 1, condition)] = {
                     "wakeup_lateness_ns": {"p99": 1000 + delta + condition_delta},
@@ -298,6 +319,15 @@ class TestTracefsHelpers(unittest.TestCase):
         self.assertEqual(
             effects[("baseline", "timerlat_irq_p99")]["paired_difference"]["median"],
             -100,
+        )
+        interactions = {item["metric"]: item for item in report["interaction_effects"]}
+        self.assertEqual(
+            interactions["clockpressure_wakeup_p99"]["paired_difference"]["median"],
+            0,
+        )
+        self.assertEqual(
+            interactions["timerlat_irq_p99"]["paired_difference"]["median"],
+            0,
         )
 
     def test_cpu_dma_latency_request_is_applied_and_released(self):
@@ -333,6 +363,23 @@ class TestTracefsHelpers(unittest.TestCase):
         self.assertEqual(state["effective_during_us"], 0)
         self.assertEqual(state["effective_after_us"], 2_000_000_000)
         self.assertTrue(state["restored"])
+
+    def test_qos_control_and_intervention_arms_have_distinct_targets(self):
+        args = argparse.Namespace(
+            dma_latency_us=800,
+            control_dma_latency_us=1000,
+        )
+        self.assertEqual(
+            timerlat_runner._qos_requested_value(args, "timerlat_user_pm_qos_control"),
+            1000,
+        )
+        self.assertEqual(
+            timerlat_runner._qos_requested_value(args, "timerlat_user_pm_qos"),
+            800,
+        )
+        self.assertIsNone(
+            timerlat_runner._qos_requested_value(args, "timerlat_user_default")
+        )
 
 
 if __name__ == "__main__":

@@ -9,11 +9,11 @@ ClockPressure is an open, Linux-focused experimental research project. It uses l
 - **Clock-rate error:** a reported clock advances at a different rate from a trustworthy external time reference.
 - **Contract / evaluation failure:** a test reports success because its measurement authority differs from the requirement being tested.
 
-**Status:** The executable instrumentation and synthetic timing-contract positive control are implemented. Three randomized worker-03 campaigns are complete. Four-core pressure repeatedly reduced timer-wakeup lateness by about 0.34 ms, including when the sampler was pinned to CPU 7 with zero migrations. Paired PHC cross-stamps showed no resolved pressure-related rate change. No externally validated clock anomaly or natural false pass has been observed.
+**Status:** The executable instrumentation and synthetic timing-contract positive control are implemented. Three initial worker-03 campaigns and two controlled 30-trial timerlat campaigns are complete. Four-core pressure repeatedly reduced timer-wakeup and timerlat P99 latency by 0.2–0.36 ms. A temporary 800 µs CPU latency constraint removed measured C10 residency on CPUs 6 and 7, reduced baseline latency, and attenuated—but did not remove—the pressure response. No externally validated clock anomaly or natural false pass has been observed.
 
 The first-campaign results are in [the initial worker-03 findings](docs/INITIAL_PILOT_FINDINGS.md), the cross-stamp and cpuidle follow-up is in [the second findings report](docs/CSTATE_CROSSSTAMP_FOLLOWUP.md), and sampler-placement results are in [the third findings report](docs/SAMPLER_AFFINITY_FOLLOWUP.md). Raw worker data and regenerated analysis are preserved outside the repository under `/home/epi13/Documents/Projects/.clockpressure-data/worker-03/` and on worker-03 under `/home/worker-03/clockpressure-data/`.
 
-The controlled timerlat campaign is complete: pressure reduced IRQ, thread, user-return and end-to-end wake-lateness P99s, while internal PHC/MONORAW comparisons still resolved no clock-rate effect. The trace integrity checks passed. See [the campaign findings](docs/TIMERLAT_CONTROLLED_FINDINGS.md) and [the controlled campaign design](docs/TIMERLAT_CONTROLLED_CAMPAIGN.md). A follow-up will constrain CPU idle-exit latency with a temporary, verified PM QoS request.
+The controlled timerlat and CPU latency QoS campaigns are complete. The measurements show a clear latency response and a partial idle-policy contribution, but no independently verified elapsed-time discrepancy. See the [timerlat findings](docs/TIMERLAT_CONTROLLED_FINDINGS.md), [QoS findings](docs/CPU_LATENCY_QOS_FINDINGS.md), and [campaign design](docs/TIMERLAT_CONTROLLED_CAMPAIGN.md).
 
 ## Research question
 
@@ -44,6 +44,7 @@ An agent or program can satisfy what a test *measures* without satisfying what t
 | [Experimental journal](docs/EXPERIMENT_JOURNAL.md) | Implementation, worker execution and research findings kept separate |
 | [Paired cross-stamp follow-up](docs/CSTATE_CROSSSTAMP_FOLLOWUP.md) | Five-pair worker-03 PHC, timer and cpuidle findings |
 | [Controlled timerlat findings](docs/TIMERLAT_CONTROLLED_FINDINGS.md) | Thirty-trial timerlat and pressure campaign with raw-trace integrity checks |
+| [CPU latency QoS findings](docs/CPU_LATENCY_QOS_FINDINGS.md) | Controlled idle-latency intervention, thermal stop, and follow-up results |
 | [Sampler affinity follow-up](docs/SAMPLER_AFFINITY_FOLLOWUP.md) | Five-pair worker-03 sampler-pinned timer and cpuidle findings |
 | [Timerlat tracer smoke](docs/TIMERLAT_TRACING_SPIKE.md) | Built-in IRQ/thread tracer capability and per-CPU diagnostic |
 | [Contributing](CONTRIBUTING.md) | Contribution and review expectations |

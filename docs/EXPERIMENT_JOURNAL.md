@@ -165,7 +165,7 @@ This journal separates implementation and test results from measurements perform
 
 - **Supports:** system pressure changes timer delivery and observed IRQ-context latency on this host under the tested policy.
 - **Does not support:** clock-rate error, physical elapsed-time error, a causal idle-state mechanism, or natural contract failure. The software timer positive control remains the only reproduced false pass.
-- **Next:** test whether PM QoS suppression of deep idle changes the pressure-associated latency reduction. The QoS design is an intervention on idle-exit policy, not a measurement of elapsed-time truth.
+- **Next:** completed the PM QoS intervention; see [the controlled QoS findings](CPU_LATENCY_QOS_FINDINGS.md). The QoS design tests idle-exit policy, not elapsed-time truth.
 
 ## 2026-10-28 — QoS0 thermal stop and targeted QoS smoke
 
@@ -179,8 +179,28 @@ This journal separates implementation and test results from measurements perform
 
 ### Method adjustment
 
-- The 0 µs request was broader than needed and triggered the thermal guard quickly. The full follow-up uses 800 µs to constrain states above the measured 890 µs C10 exit latency while leaving lower-latency states eligible. The runner now supports an idle cooldown after each trial; the planned full campaign uses 30 seconds between trials and 30 seconds before recovery. The 85°C stop threshold remains in force.
+- The 0 µs request was broader than needed and triggered the thermal guard quickly. The follow-up used 800 µs to constrain states above the measured 890 µs C10 exit latency while leaving lower-latency states eligible. The completed campaign used 30 seconds between trials and 30 seconds before recovery. The 85°C stop threshold remained in force; maximum package temperature was 77°C.
 - This policy can still change more than one idle state and does not establish that C10 alone is causal.
+
+## 2026-10-28 — CPU latency QoS paired campaign
+
+### Implemented and executed
+
+- Added C9 residency metrics and paired difference-in-differences analysis for the QoS intervention. The analyzer reports campaign integrity, trace loss, checksums, request restoration and raw trial status.
+- Completed 30 randomized trials: five replicates each of default and 800 µs QoS arms, each with baseline, pressure and recovery. The campaign used 30-second per-trial cooldowns and a 30-second wait before recovery.
+- Raw data and analysis are preserved under worker-03 `/home/worker-03/clockpressure-data/timerlat-cpu-latency-qos-800us-20261028/` and the local archive. All 30 traces passed checksums; 90,000 IRQ/thread activations matched, all QoS requests and tracefs state restored, and there were zero buffer overruns or dropped events.
+
+### Observed
+
+- The 800 µs target removed C10 residency on probe CPU 6 and timerlat CPU 7, shifting most measured idle residency into C9. At baseline it reduced ClockPressure wake P99 by about 105 µs and timerlat IRQ/thread/user-return P99 by about 105 µs compared with the default policy.
+- Pressure still reduced wake P99 by 225.5 µs under QoS800 (versus 326.4 µs under the default policy). Timerlat IRQ/thread/user-return reductions remained 195/209/253 µs. The QoS intervention attenuated those timerlat pressure effects by about 105 µs each, but did not eliminate them.
+- With the default policy, pressure reduced timerlat latency while C10 residency on CPUs 6 and 7 rose slightly. This counters the simple claim that pressure improved latency by keeping those CPUs out of C10. The QoS intervention supports a partial idle-exit-policy contribution at baseline, but several idle states and systemwide policy effects are coupled.
+- The `PTP_SYS_OFFSET_PRECISE` fit yielded an approximately 0.12 ppb QoS-by-pressure interaction, but the preceding timerlat campaign had a pressure residual of the opposite sign. The fit residual is about 41 ns over a 30-second window and serial correlation/capture uncertainty are not modeled. This is an exploratory same-host residual, not evidence of physical clock error.
+
+### Next
+
+- Compare explicit 800 µs and 1,000 µs requests, straddling the measured 890 µs C10 exit latency, to test whether the response changes at the C10 eligibility threshold or with any active QoS request.
+- Seek an independently calibrated elapsed-time reference before making a hardware-time claim.
 
 ## Findings ledger
 
@@ -194,5 +214,7 @@ This journal separates implementation and test results from measurements perform
 | CPU pressure changes timer wake lateness when sampler migration is removed | `sampler-affinity follow-up` | Five CPU 7-pinned pairs reproduced a 339.9 µs P99 reduction with zero migrations; migration is not required, mechanism still unresolved |
 | worker-03 timerlat reports per-CPU IRQ/thread latency | `tracefs diagnostic smoke` | 1,600 paired activations captured with no malformed/incomplete records; strong per-CPU differences require controlled replication |
 | CPU pressure changes IRQ-context timerlat P99 | `controlled timerlat campaign` | Five paired enabled-arm replicates reduced IRQ P99 by 315.6 µs; same-host latency observation, not clock-rate evidence |
+| An 800 µs CPU latency constraint removes measured C10 residency and changes timer latency | `30-trial QoS intervention` | C10 fell to zero on CPUs 6 and 7; baseline P99 improved about 105 µs and the pressure response attenuated about 105 µs, while a large pressure effect remained |
+| CPU pressure causes a physical PHC clock-rate change | `internal cross-stamp fit` | A sub-ppb QoS interaction was estimated, but it is inconsistent with the prior campaign and below modeled capture uncertainty; no verified clock-rate finding |
 | Paired NIC-PHC cross-timestamps provide external elapsed-time authority | `hypothesis` | The ioctl works, but its calibration, shared-clock dependencies and capture uncertainty remain unverified |
 | An autonomous agent compromised a timing evaluator | `hypothesis` | Not studied |

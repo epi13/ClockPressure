@@ -4,7 +4,7 @@
 
 The earlier worker-03 campaigns found a pressure-associated change in end-to-end timer wake lateness, while same-host PHC/MONORAW comparisons resolved no pressure-related rate change. The existing `timerlat_fd` smoke established that Linux can report IRQ-context, timerlat-thread, and return-to-userspace latency, but the smoke was not a controlled workload comparison.
 
-The `observer` design compares randomized baseline, CPU-pressure, and recovery observations with the pinned userspace timerlat reader disabled and enabled. ClockPressure collects its end-to-end absolute-sleep outcome in both arms. The `cpu_latency_qos` design keeps timerlat active in both arms and compares the default CPU idle-latency policy with a temporary `/dev/cpu_dma_latency` request. The QoS intervention tests whether tighter idle-exit latency changes or removes the observed pressure response. Timerlat splits latency along its instrumented path; it is not a clock-rate or independent elapsed-time measurement.
+The `observer` design compares randomized baseline, CPU-pressure, and recovery observations with the pinned userspace timerlat reader disabled and enabled. ClockPressure collects its end-to-end absolute-sleep outcome in both arms. The `cpu_latency_qos` design keeps timerlat active in both arms and compares the default CPU idle-latency policy with a temporary `/dev/cpu_dma_latency` request. With `--control-dma-latency-us`, it instead compares two active QoS requests, which can bracket a measured idle-state exit-latency threshold. Timerlat splits latency along its instrumented path; it is not a clock-rate or independent elapsed-time measurement.
 
 ## Placement and workload
 
@@ -62,8 +62,21 @@ sudo -n python3 -m analysis.analyze_timerlat_campaign \
 
 The campaign analyzer verifies each trace checksum, reparses activation pairs, and reports trace-buffer overrun/drop totals. Confirm the per-trial QoS `effective_before_us`, `effective_during_us`, `effective_after_us`, and `restored` fields before interpreting the intervention.
 
+To compare active requests immediately above and below worker-03's 890 µs C10 exit latency, run 1,000 µs as the control and 800 µs as the intervention:
+
+```sh
+sudo -n python3 -m experiments.run_timerlat_campaign \
+  --design cpu_latency_qos --control-dma-latency-us 1000 --dma-latency-us 800 \
+  --duration-sec 30 --period-us 10000 --repeats 5 --seed 20261038 \
+  --recovery-seconds 30 --intertrial-cooldown-sec 30 \
+  --probe-cpu 6 --timerlat-cpu 7 --load-cpus 1,2,3,4 \
+  --data-dir /home/worker-03/clockpressure-data/timerlat-c10-threshold-20261028
+sudo -n python3 -m analysis.analyze_timerlat_campaign \
+  /home/worker-03/clockpressure-data/timerlat-c10-threshold-20261028/campaign.json
+```
+
 The dataset remains local to the experimental worker and the designated hidden research-data archive; raw traces and timing samples do not belong in git. Report timerlat IRQ/thread/user-return changes separately from ClockPressure end-to-end wake lateness. Do not infer clock-rate error or contract failure from either latency measure. No calibrated external elapsed-time reference is collected by this design.
 
 ## Status
 
-The `observer` design has completed on worker-03; see [the findings report](TIMERLAT_CONTROLLED_FINDINGS.md). A first `cpu_latency_qos` attempt at 0 µs stopped at the existing 85°C thermal guard. A short 800 µs smoke confirmed the request was applied, C10 residency fell to zero on CPUs 6 and 7 during the two-second trials, and the request restored after each trial. The full randomized intervention remains pending. The request lifecycle is unit-tested, and the default `observer` mode remains available.
+Both the `observer` design and the default-versus-800 µs `cpu_latency_qos` design have completed on worker-03; see the [timerlat findings](TIMERLAT_CONTROLLED_FINDINGS.md) and [QoS findings](CPU_LATENCY_QOS_FINDINGS.md). A first 0 µs attempt stopped at the existing 85°C thermal guard; the subsequent 800 µs campaign completed all 30 trials with a maximum package temperature of 77°C. The next experiment compares active 1,000 and 800 µs requests around the measured C10 latency. QoS request lifecycle, analysis and failure-status handling are unit-tested. The default `observer` mode remains available.

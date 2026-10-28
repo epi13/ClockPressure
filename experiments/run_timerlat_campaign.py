@@ -366,6 +366,15 @@ def _stop_process(process: subprocess.Popen[bytes] | None, grace_seconds: float 
         return process.wait(timeout=2)
 
 
+def _qos_requested_value(args: argparse.Namespace, arm: str) -> int | None:
+    if arm == "timerlat_user_pm_qos":
+        return args.dma_latency_us
+    control_value = getattr(args, "control_dma_latency_us", None)
+    if arm == "timerlat_user_pm_qos_control" and control_value is not None:
+        return control_value
+    return None
+
+
 def _run_trial(
     args: argparse.Namespace,
     *,
@@ -411,9 +420,10 @@ def _run_trial(
         trace_session = TracefsTimerlat(
             Path(args.tracefs_root), args.timerlat_cpu, args.period_us, args.buffer_kb
         )
-    if arm == "timerlat_user_pm_qos":
+    qos_requested_value = _qos_requested_value(args, arm)
+    if qos_requested_value is not None:
         qos_request = CpuDmaLatencyRequest(
-            Path(args.cpu_dma_latency_path), args.dma_latency_us
+            Path(args.cpu_dma_latency_path), qos_requested_value
         )
     try:
         if qos_request is not None:
@@ -600,6 +610,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tracefs-root", default="/sys/kernel/tracing")
     parser.add_argument("--cpu-dma-latency-path", default="/dev/cpu_dma_latency")
     parser.add_argument("--dma-latency-us", type=int, default=0)
+    parser.add_argument(
+        "--control-dma-latency-us",
+        type=int,
+        help="compare with a second active QoS request instead of the existing policy",
+    )
     parser.add_argument("--data-dir", default="~/clockpressure-data/timerlat-controlled")
     return parser
 
@@ -629,6 +644,13 @@ def run_campaign(args: argparse.Namespace) -> Path:
         raise ValueError("--fifo-priority must be in 1..99")
     if not 0 <= args.dma_latency_us <= 2_000_000_000:
         raise ValueError("--dma-latency-us must be in 0..2000000000")
+    if args.control_dma_latency_us is not None:
+        if args.design != "cpu_latency_qos":
+            raise ValueError("--control-dma-latency-us requires --design cpu_latency_qos")
+        if not 0 <= args.control_dma_latency_us <= 2_000_000_000:
+            raise ValueError("--control-dma-latency-us must be in 0..2000000000")
+        if args.control_dma_latency_us <= args.dma_latency_us:
+            raise ValueError("--control-dma-latency-us must be greater than --dma-latency-us")
 
     online_cpus = os.sched_getaffinity(0)
     requested_cpus = set(args.load_cpus) | {args.probe_cpu, args.timerlat_cpu}
@@ -645,10 +667,13 @@ def run_campaign(args: argparse.Namespace) -> Path:
             Path(args.cpu_dma_latency_path), args.dma_latency_us
         )
         qos_initial_effective_us = qos_preflight.effective_before_us
-        if qos_initial_effective_us <= args.dma_latency_us:
+        qos_targets = [args.dma_latency_us]
+        if args.control_dma_latency_us is not None:
+            qos_targets.append(args.control_dma_latency_us)
+        if any(qos_initial_effective_us <= target for target in qos_targets):
             raise RuntimeError(
-                "CPU latency QoS intervention would not change the effective setting: "
-                f"current={qos_initial_effective_us} us, requested={args.dma_latency_us} us"
+                "one or more CPU latency QoS requests would not change the effective setting: "
+                f"current={qos_initial_effective_us} us, targets={qos_targets} us"
             )
 
     out = Path(args.data_dir).expanduser().resolve()
@@ -667,12 +692,19 @@ def run_campaign(args: argparse.Namespace) -> Path:
         timerlat_arms = ["timerlat_user"]
         power_intervention = None
     else:
-        arms = ["timerlat_user_default", "timerlat_user_pm_qos"]
+        control_arm = (
+            "timerlat_user_pm_qos_control"
+            if args.control_dma_latency_us is not None
+            else "timerlat_user_default"
+        )
+        arms = [control_arm, "timerlat_user_pm_qos"]
         timerlat_arms = arms.copy()
         power_intervention = {
             "device": args.cpu_dma_latency_path,
             "requested_us": args.dma_latency_us,
             "effective_before_us": qos_initial_effective_us,
+            "control_arm": control_arm,
+            "control_requested_us": args.control_dma_latency_us,
             "arm": "timerlat_user_pm_qos",
             "lifetime": "one open file descriptor held over each trial; close removes this request",
         }

@@ -15,8 +15,11 @@ _PROBE_METRICS = {
     "clockpressure_wakeup_p99": "ns",
     "clockpressure_crossstamp_fit_rate": "ppm",
     "clockpressure_monotonic_vs_raw_rate": "ppm",
+    "cpu_c9_aggregate_residency": "percentage_points",
     "cpu_c10_aggregate_residency": "percentage_points",
+    "probe_cpu_c9_residency": "percentage_points",
     "probe_cpu_c10_residency": "percentage_points",
+    "timerlat_cpu_c9_residency": "percentage_points",
     "timerlat_cpu_c10_residency": "percentage_points",
     "probe_adjacent_sample_migrations": "count",
 }
@@ -74,19 +77,26 @@ def _probe_value(
         return (run.get("internal_rate_comparisons", {}).get("monotonic_vs_raw") or {}).get(
             "difference_ppm_vs_raw"
         )
-    if metric == "cpu_c10_aggregate_residency":
+    if metric in ("cpu_c9_aggregate_residency", "cpu_c10_aggregate_residency"):
+        state = "C9" if metric == "cpu_c9_aggregate_residency" else "C10"
         return (
             run.get("environment_telemetry", {})
             .get("cpu_idle_residency_pct_of_cpu_capacity_by_state_name", {})
-            .get("C10")
+            .get(state)
         )
-    if metric in ("probe_cpu_c10_residency", "timerlat_cpu_c10_residency"):
-        cpu = probe_cpu if metric == "probe_cpu_c10_residency" else timerlat_cpu
+    if metric in (
+        "probe_cpu_c9_residency",
+        "probe_cpu_c10_residency",
+        "timerlat_cpu_c9_residency",
+        "timerlat_cpu_c10_residency",
+    ):
+        cpu = probe_cpu if metric.startswith("probe_") else timerlat_cpu
+        state = "C9" if "_c9_" in metric else "C10"
         return (
             run.get("environment_telemetry", {})
             .get("cpu_idle_residency_pct_by_cpu_state_name", {})
             .get(f"cpu{cpu}", {})
-            .get("C10")
+            .get(state)
         )
     if metric == "probe_adjacent_sample_migrations":
         return run.get("sample_cpu_migrations_between_adjacent_samples")
@@ -180,15 +190,17 @@ def build_report(
                 )
 
     intervention_effects = []
+    interaction_effects = []
     intervention = design.get("cpu_dma_latency_intervention")
     if intervention:
-        default_arm = "timerlat_user_default"
+        default_arm = str(intervention.get("control_arm", "timerlat_user_default"))
         intervention_arm = str(intervention.get("arm", "timerlat_user_pm_qos"))
+        metric_specs = (
+            *list(_PROBE_METRICS.items()),
+            *((f"timerlat_{kind}_p99", "ns") for kind in _TIMERLAT_KINDS),
+        )
         for condition in ("baseline", "cpu_pressure", "recovery"):
-            for metric_name, unit in (
-                *list(_PROBE_METRICS.items()),
-                *((f"timerlat_{kind}_p99", "ns") for kind in _TIMERLAT_KINDS),
-            ):
+            for metric_name, unit in metric_specs:
                 values = []
                 for replicate in all_replicates:
                     if metric_name.startswith("timerlat_") and metric_name.endswith("_p99"):
@@ -210,7 +222,7 @@ def build_report(
                             "condition": condition,
                             "control_arm": default_arm,
                             "intervention_arm": intervention_arm,
-                            "contrast": "cpu_dma_latency_intervention_minus_default",
+                            "contrast": "cpu_dma_latency_intervention_minus_control",
                             "metric": metric_name,
                             **_metric_record(
                                 values,
@@ -219,6 +231,53 @@ def build_report(
                             ),
                         }
                     )
+
+        for metric_name, unit in metric_specs:
+            differences = []
+            for replicate in all_replicates:
+                if metric_name.startswith("timerlat_") and metric_name.endswith("_p99"):
+                    kind = metric_name.removeprefix("timerlat_").removesuffix("_p99")
+
+                    def timer_value(arm: str, condition: str) -> Any:
+                        return (
+                            timerlat_summaries.get((arm, replicate, condition), {})
+                            .get(kind, {})
+                            .get("p99")
+                        )
+
+                    default_base = timer_value(default_arm, "baseline")
+                    default_pressure = timer_value(default_arm, "cpu_pressure")
+                    treated_base = timer_value(intervention_arm, "baseline")
+                    treated_pressure = timer_value(intervention_arm, "cpu_pressure")
+                else:
+                    value_map = probe_values[metric_name]
+                    default_base = value_map.get((default_arm, replicate, "baseline"))
+                    default_pressure = value_map.get((default_arm, replicate, "cpu_pressure"))
+                    treated_base = value_map.get((intervention_arm, replicate, "baseline"))
+                    treated_pressure = value_map.get((intervention_arm, replicate, "cpu_pressure"))
+                if all(
+                    value is not None
+                    for value in (default_base, default_pressure, treated_base, treated_pressure)
+                ):
+                    differences.append(
+                        (float(treated_pressure) - float(treated_base))
+                        - (float(default_pressure) - float(default_base))
+                    )
+            if differences:
+                interaction_effects.append(
+                    {
+                        "condition": "cpu_pressure_minus_baseline",
+                        "control_arm": default_arm,
+                        "intervention_arm": intervention_arm,
+                        "contrast": "difference_in_differences",
+                        "metric": metric_name,
+                        **_metric_record(
+                            differences,
+                            seed_base + 900 + len(interaction_effects),
+                            unit,
+                        ),
+                    }
+                )
 
     per_trial = []
     for trial in campaign.get("trials", []):
@@ -251,8 +310,17 @@ def build_report(
                 "cpu_c10_aggregate_residency_pct": probe_metrics[
                     "cpu_c10_aggregate_residency"
                 ],
+                "cpu_c9_aggregate_residency_pct": probe_metrics[
+                    "cpu_c9_aggregate_residency"
+                ],
+                "probe_cpu_c9_residency_pct": probe_metrics[
+                    "probe_cpu_c9_residency"
+                ],
                 "probe_cpu_c10_residency_pct": probe_metrics[
                     "probe_cpu_c10_residency"
+                ],
+                "timerlat_cpu_c9_residency_pct": probe_metrics[
+                    "timerlat_cpu_c9_residency"
                 ],
                 "timerlat_cpu_c10_residency_pct": probe_metrics[
                     "timerlat_cpu_c10_residency"
@@ -284,6 +352,12 @@ def build_report(
         "matched_irq_thread_activations": sum(
             (trial.get("timerlat_activation_integrity") or {}).get(
                 "matched_irq_thread_activations", 0
+            )
+            for trial in timerlat_trials
+        ),
+        "user_return_activations": sum(
+            (trial.get("timerlat_activation_integrity") or {}).get(
+                "user_return_activations", 0
             )
             for trial in timerlat_trials
         ),
@@ -329,6 +403,7 @@ def build_report(
         "clockrate_claim_allowed": False,
         "observer_effects": observer_effects,
         "intervention_effects": intervention_effects,
+        "interaction_effects": interaction_effects,
         "timerlat_integrity": timerlat_integrity,
         "paired_contrasts": contrasts,
         "per_trial": per_trial,
@@ -402,6 +477,7 @@ def analyze_campaign(campaign_path: Path) -> dict[str, Any]:
         trial["timerlat_analysis_summary"] = parsed["latency_ns"]
         trial["timerlat_activation_integrity"] = {
             "matched_irq_thread_activations": parsed["matched_irq_thread_activation_count"],
+            "user_return_activations": parsed["user_return_activation_count"],
             "incomplete_irq_thread_activations": parsed["incomplete_irq_thread_activation_count"],
             "duplicate_activation_events": parsed["duplicate_activation_event_count"],
             "malformed_latency_lines": parsed["malformed_latency_line_count"],
@@ -425,7 +501,7 @@ def _markdown(report: dict[str, Any]) -> str:
     for trial in report["per_trial"]:
         timer = trial["timerlat_p99_ns"]
         rows.append(
-            "| {replicate} | {arm} | {condition} | {samples} | {probe} | {irq} | {thread} | {user} | {crossstamp} | {mono_raw} | {c10} | {probe_c10} | {timerlat_c10} | {migrations} |".format(
+            "| {replicate} | {arm} | {condition} | {samples} | {probe} | {irq} | {thread} | {user} | {crossstamp} | {mono_raw} | {c9} | {c10} | {probe_c9} | {probe_c10} | {timerlat_c9} | {timerlat_c10} | {migrations} |".format(
                 replicate=trial["replicate"],
                 arm=trial["arm"],
                 condition=trial["condition"],
@@ -436,8 +512,11 @@ def _markdown(report: dict[str, Any]) -> str:
                 user=_format(timer.get("user_return")),
                 crossstamp=_format(trial["clockpressure_crossstamp_fit_rate_ppm"]),
                 mono_raw=_format(trial["clockpressure_monotonic_vs_raw_rate_ppm"]),
+                c9=_format(trial["cpu_c9_aggregate_residency_pct"]),
                 c10=_format(trial["cpu_c10_aggregate_residency_pct"]),
+                probe_c9=_format(trial["probe_cpu_c9_residency_pct"]),
                 probe_c10=_format(trial["probe_cpu_c10_residency_pct"]),
+                timerlat_c9=_format(trial["timerlat_cpu_c9_residency_pct"]),
                 timerlat_c10=_format(trial["timerlat_cpu_c10_residency_pct"]),
                 migrations=_format(trial["probe_adjacent_sample_migrations"]),
             )
@@ -465,6 +544,7 @@ def _markdown(report: dict[str, Any]) -> str:
             *report["paired_contrasts"],
             *report["observer_effects"],
             *report["intervention_effects"],
+            *report["interaction_effects"],
         ]
     ]
     return "\n".join(
@@ -477,8 +557,8 @@ def _markdown(report: dict[str, Any]) -> str:
             "",
             "## Per-trial outcomes",
             "",
-            "| Replicate | Arm | Condition | Probe samples | ClockPressure wake P99 (ns) | Timerlat IRQ P99 (ns) | Thread P99 (ns) | User-return P99 (ns) | PHC/MONORAW fit (ppm) | MONOTONIC/RAW (ppm) | Aggregate C10 (%) | Probe CPU C10 (%) | Timerlat CPU C10 (%) | Probe migrations |",
-            "| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Replicate | Arm | Condition | Probe samples | ClockPressure wake P99 (ns) | Timerlat IRQ P99 (ns) | Thread P99 (ns) | User-return P99 (ns) | PHC/MONORAW fit (ppm) | MONOTONIC/RAW (ppm) | Aggregate C9 (%) | Aggregate C10 (%) | Probe CPU C9 (%) | Probe CPU C10 (%) | Timerlat CPU C9 (%) | Timerlat CPU C10 (%) | Probe migrations |",
+            "| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             *rows,
             "",
             "## Paired contrasts",
