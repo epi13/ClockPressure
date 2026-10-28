@@ -9,7 +9,9 @@ ClockPressure is an open, Linux-focused experimental research project. It uses l
 - **Clock-rate error:** a reported clock advances at a different rate from a trustworthy external time reference.
 - **Contract / evaluation failure:** a test reports success because its measurement authority differs from the requirement being tested.
 
-**Status:** Initial executable instrumentation is implemented and its local functionality checks pass. worker-03 has been inventoried. The first worker-03 baseline and pressure campaign are still pending; no ClockPressure hardware result or clock anomaly is claimed yet.
+**Status:** The initial executable instrumentation and synthetic timing-contract positive control are implemented. The first randomized worker-03 baseline/CPU-pressure campaign is complete. It showed a large timer-wakeup-latency change but no resolved pressure-related clock-rate change. No externally validated clock anomaly or natural false pass has been observed.
+
+The measured result and its limits are recorded in [the initial worker-03 findings](docs/INITIAL_PILOT_FINDINGS.md). Raw worker data and regenerated analysis are preserved outside the repository at `/home/epi13/Documents/Projects/.clockpressure-data/worker-03/initial-campaign-20261028` and on worker-03 at `/home/worker-03/clockpressure-data/initial-campaign-20261028`.
 
 ## Research question
 
@@ -55,12 +57,12 @@ Do not run stressors on shared or production machines without permission. This p
 
 ClockPressure separates the native timing path, pressure generation, system instrumentation, experiment control and analysis:
 
-- `src/clockpressure_probe.c` records absolute `CLOCK_MONOTONIC` deadlines, wakeup lateness, `CLOCK_MONOTONIC_RAW`, `CLOCK_BOOTTIME`, realtime/TAI, RDTSCP/AUX, CPU IDs and an optional PTP hardware clock. It emits one JSON line per event.
+- `src/clockpressure_probe.c` records absolute `CLOCK_MONOTONIC` deadlines, wakeup lateness, `CLOCK_MONOTONIC_RAW`, `CLOCK_BOOTTIME`, realtime/TAI, RDTSCP/AUX, CPU IDs, sequential PTP reads and—when supported—paired `PTP_SYS_OFFSET_PRECISE` PHC/system cross-timestamps. It emits one JSON line per event.
 - `experiments/workloads/cpu_pressure.py` provides bounded CPU workers pinned to an explicit list. Workers use a lower CFS priority and are stopped after each trial.
 - `instrumentation/sched_wakeup.bt` records the target process's kernel `sched_wakeup` to `sched_switch` interval using `bpftrace`/`bpf_ktime_get_ns`. It is contextual evidence in the kernel monotonic domain, not a separate clock.
-- `experiments/run_trial.py` captures the environment, low-rate thermal/frequency/PSI context, per-clock read gaps, raw samples, logs and checksums. It retains interrupted runs.
+- `experiments/run_trial.py` captures the environment, low-rate thermal/frequency/PSI and per-CPU cpuidle residency context, clock-read gaps, raw samples, logs and checksums. It retains interrupted runs.
 - `experiments/run_campaign.py` runs an uninstrumented pressure-free baseline first, then seed-randomizes replicated baseline/CPU-pressure pairs, allows recovery and collects a recovery observation after every pressure run.
-- `analysis/analyze_runs.py` derives latency quantiles and internal clock-rate comparisons from retained raw runs.
+- `analysis/analyze_runs.py` derives latency quantiles, internal and paired cross-timestamp rate comparisons, endpoint read-bracket bounds, environmental summaries and run-paired contrasts from retained raw runs.
 
 On worker-03, from a checkout of the recorded revision:
 
@@ -76,7 +78,7 @@ python3 demos/timing_contract_positive_control.py
 
 The runner uses `sudo -n` only for the read-only NIC PHC clock and temporary eBPF tracing when the invoking account lacks device access. The normal output directory is outside the checkout at `~/clockpressure-data/`; raw observations and their per-run manifests are preserved there. Run the native/unit checks with `make check`.
 
-The default initial reference set is **not external**: Linux monotonic APIs and BPF timestamps are related, while the Intel NIC PHC is only a candidate independent oscillator until its rate, capture uncertainty and dependency path are characterized. NTP tracking is recorded as context and is not treated as a suitable short-window elapsed-time standard.
+The default reference set is **not external**: Linux monotonic APIs and BPF timestamps are related. The I219-LM's hardware-assisted cross-timestamp is a better-aligned internal witness than sequential reads, but it is still uncalibrated and may share a physical frequency reference with the system timer. NTP tracking is recorded as context and is not treated as a short-window elapsed-time standard.
 
 ## Quantities and interpretation
 

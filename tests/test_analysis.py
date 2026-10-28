@@ -1,11 +1,17 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from analysis.analyze_runs import (
     _bootstrap_mean_interval,
     _group_summaries,
     _period_errors,
+    _paired_crossstamp_rate,
     _quantiles,
     _rate_comparison,
+    _read_scheduler,
+    _telemetry_summary,
 )
 
 
@@ -23,6 +29,25 @@ class TestAnalysis(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["difference_ppm_vs_raw"], 5)
         self.assertEqual(result["endpoint_read_bracket_bound_ppm"], 70)
+
+    def test_paired_crossstamp_rate_uses_matched_device_and_system_times(self):
+        result = _paired_crossstamp_rate(
+            {
+                "ptp_precise_ns": 1_000_000,
+                "ptp_precise_sys_monoraw_ns": 2_000_000,
+                "ptp_precise_sys_realtime_ns": 30_000_000,
+            },
+            {
+                "ptp_precise_ns": 10_999_900,
+                "ptp_precise_sys_monoraw_ns": 12_000_000,
+                "ptp_precise_sys_realtime_ns": 40_000_200,
+            },
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["difference_ppm_vs_paired_sys_monoraw"], -10)
+        self.assertEqual(result["capture_method"], "PTP_SYS_OFFSET_PRECISE")
+        self.assertIn("not quantified", result["capture_uncertainty"])
+        self.assertEqual(result["sys_realtime_minus_paired_sys_monoraw_ppm"], 20)
 
     def test_sample_period_error_uses_skipped_sequence_delta(self):
         samples = [
@@ -56,3 +81,74 @@ class TestAnalysis(unittest.TestCase):
         )
         self.assertEqual(summary[0]["run_monotonic_minus_raw_ppm"]["median"], 4.5)
         self.assertEqual(summary[0]["run_ptp_minus_raw_ppm"]["median"], -12.0)
+
+    def test_scheduler_parser_ignores_empty_trailing_lines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "scheduler.jsonl"
+            path.write_text(
+                '{"kind":"observer_start"}\n'
+                '{"kind":"sched_runnable_to_run","runnable_latency_ns":123}\n\n\n'
+            )
+            summary, _ = _read_scheduler(path)
+        self.assertEqual(summary["event_count"], 1)
+        self.assertEqual(summary["malformed_line_count"], 0)
+        self.assertEqual(summary["runnable_latency_ns"]["p99"], 123)
+
+    def test_telemetry_summary_parses_physical_units_and_service_delta(self):
+        records = [
+            {
+                "monotonic_raw_ns_before": 1_000_000_000,
+                "snapshot_bracket_ns": 200,
+                "cpuidle_states": {
+                    "cpu0": {"state8": {"name": "C10", "time_usec": 1_000_000, "usage": 100}},
+                    "cpu1": {"state8": {"name": "C10", "time_usec": 2_000_000, "usage": 200}},
+                },
+                "temperatures": {
+                    "thermal_zone2": {
+                        "type": "x86_pkg_temp",
+                        "temp_millidegree_c": "41000",
+                    }
+                },
+                "frequencies_khz": {"policy0": {"cpuinfo_avg_freq": "3000000"}},
+                "pressure_stall_information": {
+                    "cpu": "some avg10=1.25 avg60=0.50 avg300=0.10 total=100"
+                },
+                "sensetrace_service_cgroup": {
+                    "cpu_stat": {"usage_usec": "1000"},
+                    "memory_current_bytes": "4096",
+                },
+            },
+            {
+                "monotonic_raw_ns_before": 3_000_000_000,
+                "snapshot_bracket_ns": 400,
+                "cpuidle_states": {
+                    "cpu0": {"state8": {"name": "C10", "time_usec": 1_500_000, "usage": 150}},
+                    "cpu1": {"state8": {"name": "C10", "time_usec": 2_250_000, "usage": 225}},
+                },
+                "temperatures": {
+                    "thermal_zone2": {
+                        "type": "x86_pkg_temp",
+                        "temp_millidegree_c": "43000",
+                    }
+                },
+                "frequencies_khz": {"policy0": {"cpuinfo_avg_freq": "3600000"}},
+                "pressure_stall_information": {
+                    "cpu": "some avg10=2.50 avg60=1.00 avg300=0.20 total=200"
+                },
+                "sensetrace_service_cgroup": {
+                    "cpu_stat": {"usage_usec": "1800"},
+                    "memory_current_bytes": "8192",
+                },
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "telemetry.jsonl"
+            path.write_text("".join(json.dumps(record) + "\n" for record in records))
+            summary = _telemetry_summary(path)
+        self.assertEqual(summary["sample_count"], 2)
+        self.assertEqual(summary["package_temperature_c"]["max"], 43)
+        self.assertEqual(summary["frequency_khz_by_policy"]["policy0"]["median"], 3_300_000)
+        self.assertEqual(summary["pressure_stall_avg10_pct"]["cpu"]["some"]["max"], 2.5)
+        self.assertEqual(summary["sensetrace_service_cpu_usage_delta_usec"], 800)
+        self.assertEqual(summary["cpu_idle_residency_delta_usec_by_state_name"]["C10"], 750_000)
+        self.assertEqual(summary["cpu_idle_residency_pct_of_cpu_capacity_by_state_name"]["C10"], 18.75)

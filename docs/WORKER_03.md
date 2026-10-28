@@ -17,7 +17,7 @@
 | ACPI PM timer | Registered by the kernel as a secondary 24-bit source. Its different hardware counter path has not been calibrated against an external reference. |
 | HPET | ACPI reports HPET at `0xfed00000`, and `/dev/hpet` exists. Boot logs say it is dysfunctional in PC10 and then report no address/interrupt resources in `_CRS`; it is not in the available clocksource list. Do not infer that the device node is a usable reference. |
 | RTC | `/dev/rtc0`, driver/name `rtc_cmos`; calendar-clock resolution is unsuitable for small drift measurements. |
-| NIC PHC | Intel I219-LM, driver `e1000e`, exposes `/dev/ptp0`. `ethtool -T eno1` reports hardware raw clock, RX/TX timestamp modes and IEEE-1588 “Precise” provider quality. No `ptp4l` or `phc2sys` process was observed. This is a **candidate** distinct hardware clock, not yet a calibrated independent reference. |
+| NIC PHC | Intel I219-LM, driver `e1000e`, exposes `/dev/ptp0`. `ethtool -T eno1` reports hardware raw clock, RX/TX timestamp modes and IEEE-1588 “Precise” provider quality. No `ptp4l` or `phc2sys` process was observed. Both dynamic-clock reads and `PTP_SYS_OFFSET_PRECISE` succeed. The latter returns a driver-supported pair of PHC and host MONORAW/REALTIME timestamps; it is a **better-aligned internal cross-timestamp**, not a calibrated independent reference. |
 | CPU power | `intel_pstate` active with `powersave` governor; observed policy limits 800–4,700 MHz, base 3,000 MHz. HWP is advertised. `intel_idle`/`menu` exposes enabled POLL through C10 states. No system-wide power policy was changed for the inventory. |
 | Temperature / voltage | ACPI, PCH, Dell SMM, NVIDIA GPU and CPU package/core temperature telemetry are visible. The initial snapshot was about 27–46°C depending on sensor. No voltage telemetry or powercap/RAPL file was found in the inspected sysfs paths. The pilot stops if CPU package temperature reaches 85°C. |
 | Interrupts / scheduling | Eight CPUs, IO-APIC and MSI/MSI-X sources; APIC local timer and reschedule counts are visible in `/proc/interrupts`. Scheduler, migration, IRQ, softirq, hrtimer, timer and CPU idle/frequency tracepoints exist. |
@@ -26,13 +26,19 @@
 | Permissions | `worker-03` is an unprivileged account with passwordless sudo. `perf_event_paranoid=2`; the PHC and RTC are owned by `root:clock` and require elevated access for this account. No sysctl/clocksource setting was changed. |
 | Data storage | `/home` is a persistent Btrfs subvolume on `/dev/sda3`, mounted read/write with compression. The intended external result directory under the worker account's home survives a normal reboot. |
 
+## First randomized CPU-pressure pilot
+
+The initial campaign completed on 2026-10-28 UTC. It used 20-second runs at 100 samples/s, three baseline and three four-core CPU-pressure replicates, scheduler eBPF off/on, five-second recovery waits, and a 20-second recovery observation after each pressure run. The separate first baseline sentinel plus randomized trials produced 19 complete runs. The run-level evidence and interpretation are in [INITIAL_PILOT_FINDINGS.md](INITIAL_PILOT_FINDINGS.md).
+
+Chrony later reported the host clock frequency as `+11.586 ppm fast`, matching the approximately `-11.58 ppm` MONOTONIC-minus-RAW rate observed by the first pilot. This is consistent with host frequency discipline; it is not evidence of physical elapsed-time error. The first campaign used sequential PHC reads and did not record cpuidle counters. The follow-up instrumentation adds per-CPU idle-state time and entry counters so the observed wake-latency change can be investigated against C-state behavior. That telemetry has not yet been exercised on worker-03. The Linux cpuidle `time` counter is in microseconds and `usage` is an entry count ([kernel sysfs ABI](https://github.com/torvalds/linux/blob/v6.17/Documentation/ABI/testing/sysfs-devices-system-cpu)).
+
 `/proc/timer_list` exists but returns an empty read in this kernel configuration. An `adjtimex` command is not installed. `timedatectl` and `chronyc tracking` supplied time-discipline state. Exact NTP server addresses, hardware serials and machine UUIDs are intentionally excluded from experiment manifests.
 
 ## Relationship and independence assessment
 
 1. The kernel selects invariant/nonstop TSC as its active clocksource. Ordinary monotonic clock APIs and `bpf_ktime_get_ns()` therefore do not provide an independent witness merely because they have different names or run in different contexts.
 2. `CLOCK_MONOTONIC` may receive frequency discipline; `CLOCK_MONOTONIC_RAW` avoids that discipline but still follows the host clocksource. Comparing them is an internal diagnostic.
-3. ACPI PM and the NIC PHC are separate counter/readout candidates. The PM timer's performance and dependency path are uncharacterized. The NIC PHC may use its own hardware clock, but no calibration, independent endpoint latching or oscillator/environment analysis exists yet.
+3. ACPI PM and the NIC PHC are separate counter/readout candidates. The PM timer's performance and dependency path are uncharacterized. The NIC PHC exposes a hardware-assisted cross-timestamp paired with Intel ART/MONORAW on this platform, but its calibration, oscillator dependencies and relationship to TSC remain uncharacterized.
 4. NTP is an external network source with millisecond-scale dispersion in the observed chrony report; timestamp boundaries still pass through the host. The RTC is low resolution. Neither currently qualifies as a trustworthy high-resolution elapsed-time reference.
 5. The pilot can therefore establish timer delivery/scheduler behavior and internal clock agreement only. It cannot presently establish absolute elapsed-time error.
 

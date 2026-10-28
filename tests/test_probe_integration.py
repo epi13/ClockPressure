@@ -16,6 +16,7 @@ class TestProbeIntegration(unittest.TestCase):
         )
         report = json.loads(result.stdout)
         self.assertEqual(report["kind"], "overhead")
+        self.assertEqual(report["schema"], "clockpressure.overhead.v2")
         self.assertEqual(report["samples"], 100)
         for name in (
             "monotonic_pair_gap",
@@ -29,6 +30,8 @@ class TestProbeIntegration(unittest.TestCase):
                 100 if report[name]["available"] else 0,
             )
         self.assertFalse(report["ptp_pair_gap"]["available"])
+        self.assertIn("ptp_precise_ioctl_bracket", report)
+        self.assertFalse(report["ptp_precise_ioctl_bracket"]["available"])
 
     def test_native_probe_emits_start_samples_and_end(self):
         probe = Path(__file__).resolve().parents[1] / "build" / "clockpressure-probe"
@@ -55,8 +58,11 @@ class TestProbeIntegration(unittest.TestCase):
         )
         events = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual(events[0]["kind"], "metadata")
+        self.assertEqual(events[0]["schema"], "clockpressure.sample.v2")
+        self.assertIn("ptp_precise_crossstamp_available", events[0])
         self.assertEqual(events[1]["kind"], "start")
         self.assertIn("ptp_errno", events[1])
+        self.assertIn("ptp_precise_sys_monoraw_ns", events[1])
         samples = [event for event in events if event["kind"] == "sample"]
         end = next(event for event in events if event["kind"] == "end")
         self.assertEqual(len(samples), 20)

@@ -11,6 +11,8 @@
 #include <sched.h>
 #include <signal.h>
 #include <sys/types.h>
+#include <sys/ioctl.h>
+#include <linux/ptp_clock.h>
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <cpuid.h>
@@ -33,6 +35,9 @@ typedef struct {
     uint64_t realtime_ns;
     uint64_t tai_ns;
     uint64_t ptp_ns;
+    uint64_t ptp_precise_ns;
+    uint64_t ptp_precise_sys_monoraw_ns;
+    uint64_t ptp_precise_sys_realtime_ns;
     uint64_t tsc;
     uint32_t tsc_aux;
     int cpu_before;
@@ -46,6 +51,9 @@ typedef struct {
     bool ptp_ok;
     bool ptp_attempted;
     int ptp_errno;
+    bool ptp_precise_ok;
+    bool ptp_precise_attempted;
+    int ptp_precise_errno;
     bool tsc_ok;
 } snapshot_t;
 
@@ -92,6 +100,39 @@ read_clock(clockid_t clock_id, uint64_t *value)
     if (clock_gettime(clock_id, &ts) != 0)
         return false;
     *value = timespec_ns(&ts);
+    return true;
+}
+
+static bool
+ptp_time_ns(const struct ptp_clock_time *value, uint64_t *ns)
+{
+    uint64_t seconds;
+    if (value->sec < 0 || value->nsec >= NS_PER_SEC)
+        return false;
+    seconds = (uint64_t)value->sec;
+    if (seconds > (UINT64_MAX - value->nsec) / NS_PER_SEC)
+        return false;
+    *ns = seconds * NS_PER_SEC + value->nsec;
+    return true;
+}
+
+static bool
+read_ptp_precise(int fd, snapshot_t *s)
+{
+    struct ptp_sys_offset_precise crossstamp;
+    memset(&crossstamp, 0, sizeof(crossstamp));
+    s->ptp_precise_attempted = true;
+    if (ioctl(fd, PTP_SYS_OFFSET_PRECISE, &crossstamp) != 0) {
+        s->ptp_precise_errno = errno;
+        return false;
+    }
+    if (!ptp_time_ns(&crossstamp.device, &s->ptp_precise_ns) ||
+        !ptp_time_ns(&crossstamp.sys_monoraw, &s->ptp_precise_sys_monoraw_ns) ||
+        !ptp_time_ns(&crossstamp.sys_realtime, &s->ptp_precise_sys_realtime_ns)) {
+        s->ptp_precise_errno = ERANGE;
+        return false;
+    }
+    s->ptp_precise_ok = true;
     return true;
 }
 
@@ -182,7 +223,8 @@ set_affinity(int cpu)
 }
 
 static void
-snapshot(snapshot_t *s, clockid_t ptp_clock, bool want_tsc)
+snapshot(snapshot_t *s, clockid_t ptp_clock, int ptp_fd,
+         bool want_ptp_precise, bool want_tsc)
 {
     uint64_t bracket_start = 0, bracket_end = 0;
     memset(s, 0, sizeof(*s));
@@ -201,6 +243,8 @@ snapshot(snapshot_t *s, clockid_t ptp_clock, bool want_tsc)
         if (!s->ptp_ok)
             s->ptp_errno = errno;
     }
+    if (want_ptp_precise)
+        (void)read_ptp_precise(ptp_fd, s);
     if (want_tsc)
         s->tsc_ok = read_tsc(&s->tsc, &s->tsc_aux);
     s->cpu_after = sched_getcpu();
@@ -255,6 +299,17 @@ print_snapshot_fields(const snapshot_t *s)
     else
         printf("null");
     putchar(',');
+    json_u64("ptp_precise_ns", s->ptp_precise_ok, s->ptp_precise_ns, true);
+    json_u64("ptp_precise_sys_monoraw_ns", s->ptp_precise_ok,
+             s->ptp_precise_sys_monoraw_ns, true);
+    json_u64("ptp_precise_sys_realtime_ns", s->ptp_precise_ok,
+             s->ptp_precise_sys_realtime_ns, true);
+    printf("\"ptp_precise_errno\":");
+    if (s->ptp_precise_attempted && !s->ptp_precise_ok)
+        printf("%d", s->ptp_precise_errno);
+    else
+        printf("null");
+    putchar(',');
     json_u64("tsc_ticks", s->tsc_ok, s->tsc, true);
     printf("\"tsc_aux\":");
     if (s->tsc_ok)
@@ -291,6 +346,7 @@ resolution_ns(clockid_t clock_id, bool *ok)
 static void
 print_probe_metadata(const options_t *opts, int ptp_fd,
                      uint64_t ptp_resolution, bool ptp_resolution_ok,
+                     bool ptp_precise_available, int ptp_precise_errno,
                      bool tsc_ok)
 {
     bool mono_ok, raw_ok, boot_ok, realtime_ok, tai_ok;
@@ -304,7 +360,7 @@ print_probe_metadata(const options_t *opts, int ptp_fd,
 #else
     tai_ok = false;
 #endif
-    printf("{\"kind\":\"metadata\",\"schema\":\"clockpressure.sample.v1\",");
+    printf("{\"kind\":\"metadata\",\"schema\":\"clockpressure.sample.v2\",");
     printf("\"run_id\":\"%s\",\"condition\":\"%s\",\"pid\":%ld,",
            opts->run_id, opts->condition, (long)getpid());
     printf("\"uid\":%ld,\"euid\":%ld,\"duration_ns\":%" PRIu64
@@ -318,6 +374,13 @@ print_probe_metadata(const options_t *opts, int ptp_fd,
     json_u64("realtime_resolution_ns", realtime_ok, realtime_res, true);
     json_u64("tai_resolution_ns", tai_ok, tai_res, true);
     json_u64("ptp_resolution_ns", ptp_resolution_ok, ptp_resolution, true);
+    printf("\"ptp_precise_crossstamp_available\":%s,\"ptp_precise_probe_errno\":",
+           ptp_precise_available ? "true" : "false");
+    if (ptp_fd >= 0 && !ptp_precise_available)
+        printf("%d", ptp_precise_errno);
+    else
+        printf("null");
+    putchar(',');
     printf("\"rdtscp_supported\":%s,\"compiler\":\"%s\"}\n",
            tsc_ok ? "true" : "false", __VERSION__);
 }
@@ -328,6 +391,9 @@ run_probe(const options_t *opts)
     int ptp_fd = -1;
     clockid_t ptp_clock = (clockid_t)-1;
     bool ptp_res_ok = false;
+    bool ptp_precise_available = false;
+    snapshot_t ptp_probe;
+    memset(&ptp_probe, 0, sizeof(ptp_probe));
     uint64_t ptp_res = 0;
     bool tsc_ok = rdtscp_supported();
     uint64_t start_delay_end = 0, start_mono = 0, end_mono = 0;
@@ -344,7 +410,11 @@ run_probe(const options_t *opts)
         }
     }
 
-    print_probe_metadata(opts, ptp_fd, ptp_res, ptp_res_ok, tsc_ok);
+    if (ptp_fd >= 0)
+        ptp_precise_available = read_ptp_precise(ptp_fd, &ptp_probe);
+
+    print_probe_metadata(opts, ptp_fd, ptp_res, ptp_res_ok,
+                         ptp_precise_available, ptp_probe.ptp_precise_errno, tsc_ok);
     fflush(stdout);
 
     if (opts->start_delay_ns > 0) {
@@ -359,7 +429,7 @@ run_probe(const options_t *opts)
     if (interrupted)
         goto interrupted_run;
 
-    snapshot(&s, ptp_clock, tsc_ok);
+    snapshot(&s, ptp_clock, ptp_fd, ptp_precise_available, tsc_ok);
     if (!s.monotonic_ok || !s.raw_ok) {
         fprintf(stderr, "required start clock read failed\n");
         goto error;
@@ -381,7 +451,7 @@ run_probe(const options_t *opts)
                 break;
             goto error;
         }
-        snapshot(&s, ptp_clock, tsc_ok);
+        snapshot(&s, ptp_clock, ptp_fd, ptp_precise_available, tsc_ok);
         if (!s.monotonic_ok || !s.raw_ok) {
             fprintf(stderr, "required clock read failed in sample\n");
             goto error;
@@ -414,7 +484,7 @@ run_probe(const options_t *opts)
     if (!interrupted)
         (void)sleep_until(end_mono);
 interrupted_run:
-    snapshot(&s, ptp_clock, tsc_ok);
+    snapshot(&s, ptp_clock, ptp_fd, ptp_precise_available, tsc_ok);
     printf("{\"kind\":\"end\",\"run_id\":\"%s\",\"interrupted\":%s,"
            "\"missed_deadlines\":%" PRIu64 ",",
            opts->run_id, interrupted ? "true" : "false", missed);
@@ -452,12 +522,17 @@ percentile(const uint64_t *values, size_t n, double p)
 static bool
 run_overhead(const options_t *opts)
 {
-    uint64_t *mono_gap, *raw_gap, *boot_gap, *realtime_gap, *tai_gap, *ptp_gap = NULL;
+    uint64_t *mono_gap, *raw_gap, *boot_gap, *realtime_gap, *tai_gap;
+    uint64_t *ptp_gap = NULL, *ptp_precise_gap = NULL;
     size_t n = (size_t)opts->samples, i;
-    size_t mono_n = 0, raw_n = 0, boot_n = 0, realtime_n = 0, tai_n = 0, ptp_n = 0;
-    uint64_t mono_fail = 0, raw_fail = 0, boot_fail = 0, realtime_fail = 0, tai_fail = 0, ptp_fail = 0;
+    size_t mono_n = 0, raw_n = 0, boot_n = 0, realtime_n = 0, tai_n = 0;
+    size_t ptp_n = 0, ptp_precise_n = 0;
+    uint64_t mono_fail = 0, raw_fail = 0, boot_fail = 0, realtime_fail = 0, tai_fail = 0;
+    uint64_t ptp_fail = 0, ptp_precise_fail = 0;
     int ptp_fd = -1;
     clockid_t ptp_clock = (clockid_t)-1;
+    bool ptp_precise_available = false;
+    snapshot_t ptp_probe;
     uint64_t a, b;
 #ifdef CLOCK_TAI
     const bool tai_available = true;
@@ -482,6 +557,13 @@ run_overhead(const options_t *opts)
             ptp_gap = calloc(n, sizeof(*ptp_gap));
             if (!ptp_gap)
                 goto allocation_error;
+            memset(&ptp_probe, 0, sizeof(ptp_probe));
+            ptp_precise_available = read_ptp_precise(ptp_fd, &ptp_probe);
+            if (ptp_precise_available) {
+                ptp_precise_gap = calloc(n, sizeof(*ptp_precise_gap));
+                if (!ptp_precise_gap)
+                    goto allocation_error;
+            }
         } else {
             fprintf(stderr, "open PTP device %s: %s\n", opts->ptp_path, strerror(errno));
         }
@@ -516,6 +598,16 @@ run_overhead(const options_t *opts)
             else
                 ++ptp_fail;
         }
+        if (ptp_precise_available) {
+            snapshot_t precise;
+            memset(&precise, 0, sizeof(precise));
+            if (read_clock(CLOCK_MONOTONIC_RAW, &a) &&
+                read_ptp_precise(ptp_fd, &precise) &&
+                read_clock(CLOCK_MONOTONIC_RAW, &b) && b >= a)
+                ptp_precise_gap[ptp_precise_n++] = b - a;
+            else
+                ++ptp_precise_fail;
+        }
     }
     qsort(mono_gap, mono_n, sizeof(*mono_gap), compare_u64);
     qsort(raw_gap, raw_n, sizeof(*raw_gap), compare_u64);
@@ -524,10 +616,17 @@ run_overhead(const options_t *opts)
     qsort(tai_gap, tai_n, sizeof(*tai_gap), compare_u64);
     if (ptp_gap)
         qsort(ptp_gap, ptp_n, sizeof(*ptp_gap), compare_u64);
-    printf("{\"kind\":\"overhead\",\"schema\":\"clockpressure.overhead.v1\","
+    printf("{\"kind\":\"overhead\",\"schema\":\"clockpressure.overhead.v2\","
            "\"samples\":%zu,\"pin_cpu\":%d,", n, opts->pin_cpu);
     json_string("ptp_path", opts->ptp_path ? opts->ptp_path : "", true);
     printf("\"euid\":%ld,\"ptp_open\":%s,", (long)geteuid(), ptp_fd >= 0 ? "true" : "false");
+    printf("\"ptp_precise_crossstamp_available\":%s,\"ptp_precise_probe_errno\":",
+           ptp_precise_available ? "true" : "false");
+    if (ptp_fd >= 0 && !ptp_precise_available && ptp_probe.ptp_precise_errno != 0)
+        printf("%d", ptp_probe.ptp_precise_errno);
+    else
+        printf("null");
+    putchar(',');
 #define PRINT_STATS(name, values, count, failures, available) \
     do { \
         printf("\"%s\":{\"available\":%s,\"valid_pairs\":%zu,\"failed_pairs\":%" PRIu64 ",", \
@@ -552,14 +651,23 @@ run_overhead(const options_t *opts)
         printf("\"ptp_pair_gap\":{\"available\":false,\"valid_pairs\":0,\"failed_pairs\":0,"
                "\"min_ns\":null,\"median_ns\":null,\"p95_ns\":null,\"p99_ns\":null,\"max_ns\":null},");
     }
+    if (ptp_precise_gap) {
+        PRINT_STATS("ptp_precise_ioctl_bracket", ptp_precise_gap, ptp_precise_n,
+                    ptp_precise_fail, true);
+    } else {
+        printf("\"ptp_precise_ioctl_bracket\":{\"available\":false,\"valid_pairs\":0,"
+               "\"failed_pairs\":0,\"min_ns\":null,\"median_ns\":null,\"p95_ns\":null,"
+               "\"p99_ns\":null,\"max_ns\":null},");
+    }
 #undef PRINT_STATS
-    printf("\"interpretation\":\"inter-read gap includes userspace and call overhead; not isolated vDSO/kernel service time\"}\n");
+    printf("\"interpretation\":\"clock inter-read gaps include userspace call overhead; precise PTP bracket includes two raw-clock reads and the cross-timestamp ioctl\"}\n");
     free(mono_gap);
     free(raw_gap);
     free(boot_gap);
     free(realtime_gap);
     free(tai_gap);
     free(ptp_gap);
+    free(ptp_precise_gap);
     if (ptp_fd >= 0)
         close(ptp_fd);
     return true;
@@ -572,6 +680,7 @@ allocation_error:
     free(realtime_gap);
     free(tai_gap);
     free(ptp_gap);
+    free(ptp_precise_gap);
     if (ptp_fd >= 0)
         close(ptp_fd);
     return false;

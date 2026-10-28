@@ -65,6 +65,37 @@ def _rate_comparison(start: dict[str, Any], end: dict[str, Any], clock: str) -> 
     }
 
 
+def _paired_crossstamp_rate(start: dict[str, Any], end: dict[str, Any]) -> dict[str, Any] | None:
+    device_start = start.get("ptp_precise_ns")
+    device_end = end.get("ptp_precise_ns")
+    system_start = start.get("ptp_precise_sys_monoraw_ns")
+    system_end = end.get("ptp_precise_sys_monoraw_ns")
+    if None in (device_start, device_end, system_start, system_end):
+        return None
+    system_interval = system_end - system_start
+    device_interval = device_end - device_start
+    if system_interval <= 0:
+        return None
+    result = {
+        "paired_sys_monoraw_interval_ns": system_interval,
+        "device_interval_ns": device_interval,
+        "difference_ppm_vs_paired_sys_monoraw": (
+            (device_interval - system_interval) / system_interval * 1_000_000
+        ),
+        "capture_method": "PTP_SYS_OFFSET_PRECISE",
+        "capture_uncertainty": "not quantified; crossstamp is internal and is not an external calibration",
+    }
+    realtime_start = start.get("ptp_precise_sys_realtime_ns")
+    realtime_end = end.get("ptp_precise_sys_realtime_ns")
+    if realtime_start is not None and realtime_end is not None:
+        realtime_interval = realtime_end - realtime_start
+        result["paired_sys_realtime_interval_ns"] = realtime_interval
+        result["sys_realtime_minus_paired_sys_monoraw_ppm"] = (
+            (realtime_interval - system_interval) / system_interval * 1_000_000
+        )
+    return result
+
+
 def _period_errors(samples: list[dict[str, Any]], period_ns: int, clock: str) -> list[float]:
     ordered = sorted(samples, key=lambda sample: sample["seq"])
     errors = []
@@ -110,6 +141,8 @@ def _read_scheduler(path: Path) -> tuple[dict[str, Any], str | None]:
     latencies = []
     malformed = 0
     for line in path.read_text(errors="replace").splitlines():
+        if not line.strip():
+            continue
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
@@ -125,6 +158,192 @@ def _read_scheduler(path: Path) -> tuple[dict[str, Any], str | None]:
         },
         None,
     )
+
+
+def _telemetry_summary(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"sample_count": 0}
+    records = _load_jsonl(path)
+    temperatures: dict[str, list[float]] = {}
+    package_temperatures: list[float] = []
+    frequencies: dict[str, list[float]] = {}
+    pressure: dict[str, dict[str, list[float]]] = {}
+    brackets: list[float] = []
+    service_usage: list[float] = []
+    service_memory: list[float] = []
+    idle_counters: dict[tuple[str, str, str], dict[str, list[int]]] = {}
+    idle_cpu_sets: list[set[str]] = []
+
+    for record in records:
+        bracket = record.get("snapshot_bracket_ns")
+        if isinstance(bracket, (int, float)):
+            brackets.append(float(bracket))
+
+        for sensor, reading in record.get("temperatures", {}).items():
+            value = reading.get("temp_millidegree_c")
+            try:
+                celsius = float(value) / 1000
+            except (TypeError, ValueError):
+                continue
+            temperatures.setdefault(sensor, []).append(celsius)
+            if reading.get("type") == "x86_pkg_temp":
+                package_temperatures.append(celsius)
+
+        for policy, readings in record.get("frequencies_khz", {}).items():
+            value = readings.get("cpuinfo_avg_freq") or readings.get("scaling_cur_freq")
+            try:
+                frequency = float(value)
+            except (TypeError, ValueError):
+                continue
+            frequencies.setdefault(policy, []).append(frequency)
+
+        for cpu, states in record.get("cpuidle_states", {}).items():
+            for state_id, state in states.items():
+                name = state.get("name") or state_id
+                counters = idle_counters.setdefault(
+                    (cpu, state_id, name), {"time_usec": [], "usage": []}
+                )
+                for counter in ("time_usec", "usage"):
+                    value = state.get(counter)
+                    if isinstance(value, int) and value >= 0:
+                        counters[counter].append(value)
+        idle_cpu_sets.append(set(record.get("cpuidle_states", {})))
+
+        for resource, text in record.get("pressure_stall_information", {}).items():
+            if not isinstance(text, str):
+                continue
+            for line in text.splitlines():
+                fields = line.split()
+                if not fields or fields[0] not in ("some", "full"):
+                    continue
+                value = next(
+                    (field.partition("=")[2] for field in fields if field.startswith("avg10=")),
+                    None,
+                )
+                try:
+                    pressure.setdefault(resource, {}).setdefault(fields[0], []).append(float(value))
+                except (TypeError, ValueError):
+                    continue
+
+        service = record.get("sensetrace_service_cgroup", {})
+        usage = service.get("cpu_stat", {}).get("usage_usec")
+        memory = service.get("memory_current_bytes")
+        try:
+            service_usage.append(float(usage))
+        except (TypeError, ValueError):
+            pass
+        try:
+            service_memory.append(float(memory))
+        except (TypeError, ValueError):
+            pass
+
+    def delta(values: list[float]) -> float | None:
+        if len(values) < 2 or values[-1] < values[0]:
+            return None
+        return values[-1] - values[0]
+
+    idle_cpus = set.intersection(*idle_cpu_sets) if idle_cpu_sets else set()
+
+    idle_by_cpu_state = {}
+    idle_time_by_name: dict[str, int] = {}
+    idle_usage_by_name: dict[str, int] = {}
+    for (cpu, state_id, name), counters in sorted(idle_counters.items()):
+        if cpu not in idle_cpus:
+            continue
+        time_delta = delta(counters["time_usec"])
+        usage_delta = delta(counters["usage"])
+        idle_by_cpu_state[f"{cpu}/{state_id}"] = {
+            "name": name,
+            "time_delta_usec": time_delta,
+            "usage_delta": usage_delta,
+        }
+        if time_delta is not None:
+            idle_time_by_name[name] = idle_time_by_name.get(name, 0) + int(time_delta)
+        if usage_delta is not None:
+            idle_usage_by_name[name] = idle_usage_by_name.get(name, 0) + int(usage_delta)
+
+    elapsed_ns = None
+    if len(records) >= 2:
+        first = records[0].get("monotonic_raw_ns_before")
+        last = records[-1].get("monotonic_raw_ns_before")
+        if isinstance(first, int) and isinstance(last, int) and last > first:
+            elapsed_ns = last - first
+    cpu_capacity_usec = elapsed_ns / 1000 * len(idle_cpus) if elapsed_ns and idle_cpus else None
+    idle_pct_by_name = {
+        name: (time_delta / cpu_capacity_usec * 100)
+        for name, time_delta in idle_time_by_name.items()
+    } if cpu_capacity_usec else {}
+
+    return {
+        "sample_count": len(records),
+        "snapshot_read_bracket_ns": _quantiles(brackets),
+        "package_temperature_c": _quantiles(package_temperatures),
+        "temperature_c_by_sensor": {
+            sensor: _quantiles(values) for sensor, values in sorted(temperatures.items())
+        },
+        "frequency_khz_by_policy": {
+            policy: _quantiles(values) for policy, values in sorted(frequencies.items())
+        },
+        "pressure_stall_avg10_pct": {
+            resource: {
+                category: _quantiles(values) for category, values in sorted(categories.items())
+            }
+            for resource, categories in sorted(pressure.items())
+        },
+        "sensetrace_service_cpu_usage_delta_usec": delta(service_usage),
+        "sensetrace_service_memory_current_bytes": _quantiles(service_memory),
+        "cpu_idle_cpus_observed": len(idle_cpus),
+        "cpu_idle_elapsed_ns": elapsed_ns,
+        "cpu_idle_residency_delta_usec_by_cpu_state": idle_by_cpu_state,
+        "cpu_idle_residency_delta_usec_by_state_name": idle_time_by_name,
+        "cpu_idle_usage_delta_by_state_name": idle_usage_by_name,
+        "cpu_idle_residency_pct_of_cpu_capacity_by_state_name": idle_pct_by_name,
+    }
+
+
+def _environment_group_summaries(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for run in runs:
+        grouped.setdefault((run["condition"], run["observer"]), []).append(run)
+    summaries = []
+    for (condition, observer), members in sorted(grouped.items()):
+        environments = [run.get("environment_telemetry", {}) for run in members]
+        summaries.append(
+            {
+                "condition": condition,
+                "observer": observer,
+                "run_count": len(members),
+                "run_package_temperature_max_c": _quantiles(
+                    [
+                        value["package_temperature_c"]["max"]
+                        for value in environments
+                        if value.get("package_temperature_c", {}).get("max") is not None
+                    ]
+                ),
+                "run_cpu_psi_some_avg10_max_pct": _quantiles(
+                    [
+                        value["pressure_stall_avg10_pct"]["cpu"]["some"]["max"]
+                        for value in environments
+                        if value.get("pressure_stall_avg10_pct", {}).get("cpu", {}).get("some", {}).get("max") is not None
+                    ]
+                ),
+                "run_sensetrace_cpu_usage_delta_usec": _quantiles(
+                    [
+                        value["sensetrace_service_cpu_usage_delta_usec"]
+                        for value in environments
+                        if value.get("sensetrace_service_cpu_usage_delta_usec") is not None
+                    ]
+                ),
+                "run_c10_cpu_idle_residency_pct": _quantiles(
+                    [
+                        value["cpu_idle_residency_pct_of_cpu_capacity_by_state_name"]["C10"]
+                        for value in environments
+                        if value.get("cpu_idle_residency_pct_of_cpu_capacity_by_state_name", {}).get("C10") is not None
+                    ]
+                ),
+            }
+        )
+    return summaries
 
 
 def _checksum_status(run_dir: Path, manifest: dict[str, Any]) -> dict[str, str]:
@@ -158,6 +377,7 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
     raw_period_error = _period_errors(samples, period_ns, "monotonic_raw_ns")
     scheduler, _ = _read_scheduler(run_dir / "scheduler.jsonl")
     integrity = _checksum_status(run_dir, manifest)
+    environment = _telemetry_summary(run_dir / "telemetry.jsonl")
 
     return {
         "run_id": manifest["run_id"],
@@ -186,6 +406,7 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
                 ("ptp_vs_raw", "ptp_ns"),
             )
         },
+        "paired_crossstamp_rate": _paired_crossstamp_rate(start, end),
         "wakeup_lateness_ns": _quantiles(lateness),
         "wakeup_lateness_exploratory_outliers": _robust_outlier_count(lateness),
         "sample_period_error_ppm_vs_requested_period": {
@@ -201,9 +422,8 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "timestamp_overhead": json.loads((run_dir / "overhead.json").read_text())
         if (run_dir / "overhead.json").exists()
         else None,
-        "telemetry_sample_count": len(_load_jsonl(run_dir / "telemetry.jsonl"))
-        if (run_dir / "telemetry.jsonl").exists()
-        else 0,
+        "telemetry_sample_count": environment["sample_count"],
+        "environment_telemetry": environment,
         "integrity": integrity,
         "evidence_scope": manifest["measurement_semantics"]["evidence_scope"],
         "reference_status": "no independent external elapsed-time reference was acquired",
@@ -227,6 +447,11 @@ def _group_summaries(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             for run in members
             if run["internal_rate_comparisons"].get("ptp_vs_raw")
         ]
+        crossstamp_rates = [
+            run["paired_crossstamp_rate"]["difference_ppm_vs_paired_sys_monoraw"]
+            for run in members
+            if run.get("paired_crossstamp_rate")
+        ]
         summaries.append(
             {
                 "condition": condition,
@@ -237,6 +462,7 @@ def _group_summaries(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 ),
                 "run_monotonic_minus_raw_ppm": _quantiles(mono_rates),
                 "run_ptp_minus_raw_ppm": _quantiles(ptp_rates),
+                "run_ptp_precise_minus_paired_sys_monoraw_ppm": _quantiles(crossstamp_rates),
             }
         )
     return summaries
@@ -321,28 +547,50 @@ def _markdown(report: dict[str, Any]) -> str:
     for run in report["runs"]:
         raw = run.get("internal_rate_comparisons", {}).get("monotonic_vs_raw") or {}
         ptp = run.get("internal_rate_comparisons", {}).get("ptp_vs_raw") or {}
+        paired_ptp = run.get("paired_crossstamp_rate") or {}
         latency = run["wakeup_lateness_ns"]
         sched = run["scheduler_witness"]["runnable_latency_ns"]
+        mono = "{rate} / ±{bound}".format(
+            rate=_fmt(raw.get("difference_ppm_vs_raw")),
+            bound=_fmt(raw.get("endpoint_read_bracket_bound_ppm")),
+        )
+        nic = "{rate} / ±{bound}".format(
+            rate=_fmt(ptp.get("difference_ppm_vs_raw")),
+            bound=_fmt(ptp.get("endpoint_read_bracket_bound_ppm")),
+        )
         rows.append(
-            "| {id} | {condition} | {observer} | {n} | {wake_p99} | {mono_ppm} | {ptp_ppm} | {sched_p99} |".format(
+            "| {id} | {condition} | {observer} | {n} | {wake_p99} | {mono} | {nic} | {paired_ptp} | {sched_p99} |".format(
                 id=run["run_id"],
                 condition=run["condition"],
                 observer=run["observer"],
                 n=run["samples"],
                 wake_p99=_fmt(latency.get("p99")),
-                mono_ppm=_fmt(raw.get("difference_ppm_vs_raw")),
-                ptp_ppm=_fmt(ptp.get("difference_ppm_vs_raw")),
+                mono=mono,
+                nic=nic,
+                paired_ptp=_fmt(paired_ptp.get("difference_ppm_vs_paired_sys_monoraw")),
                 sched_p99=_fmt(sched.get("p99")),
             )
         )
+    environment_rows = [
+        "| {condition} | {observer} | {n} | {temperature} | {cpu_psi} | {c10} | {sensetrace} |".format(
+            condition=summary["condition"],
+            observer=summary["observer"],
+            n=summary["run_count"],
+            temperature=_fmt(summary["run_package_temperature_max_c"].get("median")),
+            cpu_psi=_fmt(summary["run_cpu_psi_some_avg10_max_pct"].get("median")),
+            c10=_fmt(summary["run_c10_cpu_idle_residency_pct"].get("median")),
+            sensetrace=_fmt(summary["run_sensetrace_cpu_usage_delta_usec"].get("median")),
+        )
+        for summary in report["environment_group_summaries"]
+    ]
     return "\n".join(
         [
             "# ClockPressure initial pilot analysis",
             "",
             f"Runs analyzed: {len(report['runs'])}",
             "",
-            "| Run | Condition | eBPF | Samples | Wake late p99 (ns) | MONOTONIC vs RAW (ppm) | NIC PHC vs RAW (ppm) | eBPF runnable latency p99 (ns) |",
-            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
+            "| Run | Condition | eBPF | Samples | Wake late p99 (ns) | MONOTONIC–RAW ppm / endpoint bound | NIC PHC–RAW ppm / endpoint bound | PHC vs paired MONORAW crossstamp (ppm) | eBPF runnable latency p99 (ns) |",
+            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
             *rows,
             "",
             "## Paired within-campaign contrasts",
@@ -376,11 +624,21 @@ def _markdown(report: dict[str, Any]) -> str:
                 for contrast in report["paired_contrasts"]
             ],
             "",
+            "## Environmental telemetry by condition",
+            "",
+            "Values show the median of per-run maxima (package temperature and CPU PSI), or per-run SenseTrace cgroup CPU-usage increments. Detailed per-run distributions remain in `analysis.json`.",
+            "",
+            "| Condition | eBPF | Runs | Package max (°C) | CPU PSI some avg10 max (%) | Per-CPU C10 residency (%) | SenseTrace CPU delta (µs) |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+            *environment_rows,
+            "",
             "## Interpretation limits",
             "",
             "- Wakeup lateness is event-delivery delay measured against `CLOCK_MONOTONIC`; it does not establish clock-rate error.",
             "- `CLOCK_MONOTONIC`, `CLOCK_MONOTONIC_RAW`, `CLOCK_BOOTTIME`, and eBPF `bpf_ktime_get_ns()` share the kernel timekeeping path or related hardware. Their differences are internal diagnostics.",
             "- The Intel e1000e PHC is a candidate separate hardware clock. This pilot does not establish oscillator independence, calibration uncertainty, or independent capture of the exact endpoints.",
+            "- When available, `PTP_SYS_OFFSET_PRECISE` returns a driver-supported PHC/system cross-timestamp. Its paired rate result reduces userspace read-order ambiguity but remains an internal comparison with unquantified cross-timestamp accuracy; it is not an external standard.",
+            "- CPU C10 residency is the aggregate fraction of per-CPU capacity spent in the named cpuidle state. It does not expose package C-state residency or prove the cause of timer wakeup changes.",
             "- Endpoint read brackets are reported as conservative acquisition bounds; they are not calibration certificates or a complete uncertainty budget.",
             "- No external elapsed-time reference was acquired, so these data cannot establish physical clock drift or a hardware-caused false pass.",
             "- Raw JSONL, the per-run manifests, source revision and checksums are retained beside this analysis.",
@@ -412,12 +670,14 @@ def analyze(data_dir: Path) -> dict[str, Any]:
         "analysis_code": "analysis/analyze_runs.py",
         "runs": runs,
         "group_summaries": _group_summaries(runs),
+        "environment_group_summaries": _environment_group_summaries(runs),
         "paired_contrasts": _paired_contrasts(runs),
         "limits": {
             "external_reference": False,
             "physical_clock_drift_claim_allowed": False,
             "bpf_clock_independent": False,
             "ptp_independence_verified": False,
+            "ptp_precise_crossstamp_is_external": False,
             "bootstrap_unit": "run-level paired summaries; timer samples are not treated as independent replicates",
         },
     }

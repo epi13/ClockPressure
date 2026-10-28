@@ -14,8 +14,8 @@ Raw measurements are the evidence. Derived summaries, charts and agent explanati
     probe.jsonl                # native sample / endpoint events
     scheduler.jsonl            # optional target-TID eBPF events
     scheduler.stderr           # attach, diagnostics and loss messages
-    overhead.json              # clock inter-read-gap quantiles
-    telemetry.jsonl            # temperature/frequency/PSI context, about 1 Hz
+    overhead.json              # clock inter-read and PHC cross-timestamp brackets
+    telemetry.jsonl            # temperature/frequency/PSI/cpuidle context, about 1 Hz
     workload.jsonl             # pressure start/stop and CPU affinity
     *.stderr                   # process diagnostics
   analysis.json
@@ -38,7 +38,7 @@ Minimum fields:
 | Data | raw artifact path / URI, SHA-256 checksum, units / schema version |
 | Outcome | completion / abort reason, exclusions, anomalies, recovery state |
 
-The implementation records a clock snapshot/environment on both sides of the trial, the native probe's actual UID/EUID and clock resolutions, campaign ID/replicate/role, start/end intervals by available clock, artifact checksums, periodic CPU frequency/temperature, Linux pressure-stall information, memory availability and SenseTrace service-cgroup resource counters. It deliberately omits DMI serials/UUIDs, upstream NTP host/IP and process command lines.
+The implementation records a clock snapshot/environment on both sides of the trial, the native probe's actual UID/EUID and clock resolutions, campaign ID/replicate/role, start/end intervals by available clock, artifact checksums, periodic CPU frequency/temperature/per-CPU cpuidle counters, Linux pressure-stall information, memory availability and SenseTrace service-cgroup resource counters. When a PTP driver supports `PTP_SYS_OFFSET_PRECISE`, the native probe retains matched device, MONORAW and REALTIME timestamps and records whether the ioctl was available or failed. It deliberately omits DMI serials/UUIDs, upstream NTP host/IP and process command lines.
 
 ## Sample event schema (design only)
 
@@ -61,7 +61,7 @@ Publish for each condition: raw count, exclusions, uncertainty, event-loss rate,
 
 A genuine externally validated drift claim requires a description of the independent reference *and how boundaries are latched*, not just a plot of two host clocks.
 
-The current analysis estimates monotonic/RAW and optional PHC rates across the same process start/end sequence and reports the sum of their endpoint read brackets in ppm. That bracket is an acquisition-alignment bound only; it is not oscillator calibration uncertainty. Pairwise bootstrap intervals use replicate-level P99-lateness differences and are marked unavailable when fewer than three run pairs exist. They describe between-run variation within one campaign; they are not external-clock confidence bounds and should not be inferred from per-sample independent resampling.
+The current analysis estimates monotonic/RAW and optional sequential PHC rates across the same process start/end sequence and reports the sum of their endpoint read brackets in ppm. That bracket is an acquisition-alignment bound only; it is not oscillator calibration uncertainty. It separately computes PHC rate from driver-paired `PTP_SYS_OFFSET_PRECISE` device/system timestamps when present; that comparison reduces userspace read-order ambiguity but has unquantified driver/hardware capture uncertainty and is not external validation. Pairwise bootstrap intervals use replicate-level P99-lateness differences and are marked unavailable when fewer than three run pairs exist. They describe between-run variation within one campaign; they are not external-clock confidence bounds and should not be inferred from per-sample independent resampling.
 
 ## Reproduction checklist
 

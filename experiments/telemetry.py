@@ -16,6 +16,14 @@ def _read(path: str | Path) -> str | None:
         return None
 
 
+def _read_int(path: str | Path) -> int | None:
+    value = _read(path)
+    try:
+        return int(value) if value is not None else None
+    except ValueError:
+        return None
+
+
 def sample_context() -> dict[str, Any]:
     before = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
     frequencies = {}
@@ -39,6 +47,23 @@ def sample_context() -> dict[str, Any]:
             value = _read(path)
             if value is not None:
                 temperatures[f"{name}/{path.name}"] = {"temp_millidegree_c": value}
+    cpuidle_states = {}
+    for cpu_dir in sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*")):
+        cpu_name = Path(cpu_dir).name
+        states = {}
+        for state_dir in sorted(Path(cpu_dir, "cpuidle").glob("state*")):
+            state_name = state_dir.name
+            name = _read(state_dir / "name")
+            time_usec = _read_int(state_dir / "time")
+            usage = _read_int(state_dir / "usage")
+            if name is not None or time_usec is not None or usage is not None:
+                states[state_name] = {
+                    "name": name,
+                    "time_usec": time_usec,
+                    "usage": usage,
+                }
+        if states:
+            cpuidle_states[cpu_name] = states
     pressure = {name: _read(f"/proc/pressure/{name}") for name in ("cpu", "memory", "io")}
     loadavg = _read("/proc/loadavg")
     memory_available = None
@@ -64,6 +89,7 @@ def sample_context() -> dict[str, Any]:
         "snapshot_bracket_ns": after - before,
         "frequencies_khz": frequencies,
         "temperatures": temperatures,
+        "cpuidle_states": cpuidle_states,
         "pressure_stall_information": pressure,
         "load_average": loadavg,
         "memory_available": memory_available,
